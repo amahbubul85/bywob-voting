@@ -3,7 +3,7 @@
 import random
 import string
 import time
-from datetime import datetime, date, time as dtime, timedelta, timezone
+from datetime import datetime, date, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -25,7 +25,6 @@ RETRY_SLEEP_SEC = 2.0            # initial backoff
 # ------------------------------------------------------------------------------
 # Google Sheets Connect (modern creds) + caching
 # ------------------------------------------------------------------------------
-
 @st.cache_resource(show_spinner=False)
 def get_client_and_sheet():
     scope = [
@@ -45,7 +44,6 @@ st.caption(f"SA: {creds.service_account_email} | Project: {creds.project_id}")
 # ------------------------------------------------------------------------------
 # Gentle retry wrapper (helps on transient 429s)
 # ------------------------------------------------------------------------------
-
 def gs_retry(fn, *args, **kwargs):
     tries = 0
     sleep = RETRY_SLEEP_SEC
@@ -53,7 +51,6 @@ def gs_retry(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            # If quota or similar, backoff a bit
             tries += 1
             if tries >= RETRY_MAX_TRIES:
                 raise
@@ -63,7 +60,6 @@ def gs_retry(fn, *args, **kwargs):
 # ------------------------------------------------------------------------------
 # Helpers: ensure worksheets & headers (run once)
 # ------------------------------------------------------------------------------
-
 def ensure_worksheet(sh_, title, headers=None, rows=1000, cols=20):
     try:
         ws = gs_retry(sh_.worksheet, title)
@@ -98,7 +94,6 @@ except Exception as e:
 # ------------------------------------------------------------------------------
 # Meta helpers (cached)
 # ------------------------------------------------------------------------------
-
 @st.cache_data(ttl=30, show_spinner=False)
 def meta_get_all_cached(sheet_id: str):
     ws = gs_retry(sh.worksheet, "meta")
@@ -106,19 +101,17 @@ def meta_get_all_cached(sheet_id: str):
     return {r["key"]: r["value"] for r in rows}
 
 def meta_bulk_set(kv: dict):
-    """Write-through: update meta and clear its cache."""
     ws = gs_retry(sh.worksheet, "meta")
     rows = gs_retry(ws.get_all_records)
     d = {r["key"]: r["value"] for r in rows}
     d.update(kv)
     gs_retry(ws.clear)
     gs_retry(ws.update, "A1", [["key", "value"]] + [[k, d[k]] for k in d])
-    meta_get_all_cached.clear()  # invalidate cache
+    meta_get_all_cached.clear()
 
 # ------------------------------------------------------------------------------
 # Sheet readers (cached)
 # ------------------------------------------------------------------------------
-
 @st.cache_data(ttl=30, show_spinner=False)
 def read_df_cached(sheet_id: str, tab: str) -> pd.DataFrame:
     ws = gs_retry(sh.worksheet, tab)
@@ -128,13 +121,11 @@ def read_df_cached(sheet_id: str, tab: str) -> pd.DataFrame:
     return pd.DataFrame(vals[1:], columns=vals[0])
 
 def read_df(tab: str) -> pd.DataFrame:
-    # convenience wrapper using cached read
     return read_df_cached(SHEET_ID, tab)
 
 # ------------------------------------------------------------------------------
 # Results recompute (only on submit/admin)
 # ------------------------------------------------------------------------------
-
 def write_results_from_votes():
     votes = read_df("votes")
     if votes.empty:
@@ -152,13 +143,11 @@ def write_results_from_votes():
         if not df.empty
         else [["position", "candidate", "votes"]],
     )
-    # invalidate cache so Results tab sees fresh data quickly
     read_df_cached.clear()
 
 # ------------------------------------------------------------------------------
 # Voting helpers
 # ------------------------------------------------------------------------------
-
 def validate_token(token_str: str):
     voters = read_df("voters")
     if voters.empty:
@@ -170,17 +159,17 @@ def validate_token(token_str: str):
     used = str(row.iloc[0].get("used", "")).strip().lower()
     if used in ("true", "1", "yes", "y"):
         return False, None
-    return True, row.index[0]  # df index (0-based excluding header)
+    return True, row.index[0]
 
 def mark_token_used(df_index: int):
     ws = gs_retry(sh.worksheet, "voters")
-    row_num = df_index + 2  # header at row 1
+    row_num = df_index + 2
     used_col = 4
     used_at_col = 5
     now_cet = datetime.now(CET).isoformat()
     gs_retry(ws.update_cell, row_num, used_col, "TRUE")
     gs_retry(ws.update_cell, row_num, used_at_col, now_cet)
-    read_df_cached.clear()  # voters cache bust
+    read_df_cached.clear()
 
 def generate_tokens(count: int, prefix: str):
     tokens = []
@@ -193,7 +182,6 @@ def generate_tokens(count: int, prefix: str):
 # ------------------------------------------------------------------------------
 # UI
 # ------------------------------------------------------------------------------
-
 st.title("🗳️ BYWOB Voting Platform")
 
 with st.sidebar:
@@ -233,7 +221,6 @@ with tabs[0]:
         if start_dt: st.caption(f"Starts: {start_dt} CET")
         if end_dt:   st.caption(f"Ends  : {end_dt} CET")
 
-        # Gate by time/status
         allowed = False
         if status == "ongoing":
             allowed = True
@@ -252,26 +239,44 @@ with tabs[0]:
                 if not valid:
                     st.error("❌ Invalid or already used token.")
                 else:
-                    pos_df = read_df("positions")
-                    cand_df = read_df("candidates")
-                    if pos_df.empty or cand_df.empty:
+                    # Load from Google Sheet (no hard-coded options)
+                    pos_df_raw = read_df("positions")
+                    cand_df_raw = read_df("candidates")
+                    if pos_df_raw.empty or cand_df_raw.empty:
                         st.error("পদের তালিকা বা প্রার্থীদের তালিকা খালি। Admin ট্যাব থেকে যোগ করুন।")
                     else:
+                        # Clean + deduplicate to prevent duplicate widget ids
+                        pos_series = (
+                            pos_df_raw["position"]
+                            .astype(str).str.strip()
+                            .replace({"": pd.NA})
+                            .dropna()
+                            .drop_duplicates()
+                        )
+                        cand_df = cand_df_raw.copy()
+                        cand_df["position"]  = cand_df["position"].astype(str).str.strip()
+                        cand_df["candidate"] = cand_df["candidate"].astype(str).str.strip()
+                        cand_df = cand_df.replace({"": pd.NA}).dropna(subset=["position", "candidate"])
+                        cand_df = cand_df.drop_duplicates(subset=["position", "candidate"])
+
                         st.success("✅ Token OK. Select your choices below.")
                         with st.form("full_ballot"):
                             selections = {}
-                            for _, row in pos_df.iterrows():
-                                p = (row.get("position") or "").strip()
-                                if not p:
-                                    continue
-                                cands = cand_df[cand_df["position"].str.strip() == p]["candidate"].tolist()
+                            for idx, p in enumerate(pos_series):
+                                cands = cand_df.loc[cand_df["position"] == p, "candidate"].tolist()
                                 if not cands:
                                     st.warning(f"'{p}' পদের জন্য কোন প্রার্থী নেই।")
                                     continue
-                                choice = st.radio(f"Position: {p}", options=cands, horizontal=True)
+                                # Old stacked UI: one dropdown per position (unique key!)
+                                choice = st.selectbox(
+                                    label=f"{p}",
+                                    options=cands,
+                                    index=0,
+                                    key=f"ballot_{idx}_{p}",
+                                )
                                 selections[p] = choice
 
-                            submitted = st.form_submit_button("Submit All Votes")
+                            submitted = st.form_submit_button("✅ Submit Vote")
                             if submitted:
                                 ws_votes = gs_retry(sh.worksheet, "votes")
                                 timestamp_cet = datetime.now(CET).isoformat()
@@ -306,7 +311,7 @@ with tabs[1]:
 
         c1, _ = st.columns([1, 3])
         if c1.button("🔄 Refresh now"):
-            read_df_cached.clear()  # clear all cached reads
+            read_df_cached.clear()
             st.rerun()
 
         res_df = read_df("results")
