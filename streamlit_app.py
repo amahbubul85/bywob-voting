@@ -348,6 +348,7 @@ with tab_results:
         st.dataframe(r, width="stretch")
 
 # ------------------------ Admin Tab ------------------------
+# ------------------------ Admin Tab ------------------------
 with tab_admin:
     st.subheader("🛠️ Admin Tools")
 
@@ -461,13 +462,14 @@ with tab_admin:
         if cands_df.empty:
             st.info("candidates শিট ফাঁকা। position, candidate কলামসহ ডেটা দিন।")
         else:
-            st.dataframe(cands_df, width="stretch")
+            st.dataframe(cands_df, width="stretch")  # Show all candidates in a single table
 
         st.markdown("### 📈 Tally (by position)")
         vdf = load_votes_df()
         if vdf.empty:
             st.info("এখনও কোনো ভোট পড়েনি।")
         else:
+            # Show results grouped by position
             for pos in cands_df["position"].unique():
                 grp = (
                     vdf[vdf["position"] == pos]
