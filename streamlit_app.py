@@ -37,4 +37,5 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service
 client = gspread.authorize(creds)
 
 SHEET_ID = st.secrets["gcp_service_account"]["SHEET_ID"]
-sheet = client.ope
+sheet = client.open_by_key(SHEET_ID)  # ✅ সঠিক
+
