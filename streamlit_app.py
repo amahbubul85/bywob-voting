@@ -1,20 +1,19 @@
 # streamlit_app.py
 # BYWOB Online Voting — Streamlit + Google Sheets
 # Features:
-# - One-time token voting (secret ballot)
-# - Election window (start/end in UTC) with status: idle | ongoing | ended | published
+# - One-time token voting
+# - Election window (start/end in UTC): idle | ongoing | ended | published
 # - Block votes outside window, publish/declare results
-# - Token generator (unlimited)
+# - Token generator (no hard max)
 # - Live tally, CSV export
-# - Archive & clear votes to prepare next election
-# - Robust handling of 'used' column being string/boolean
+# - Archive & clear votes for next election
+# - Robust 'used' handling (string/boolean)
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import io
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
@@ -24,15 +23,10 @@ st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time toke
 # Secrets & Google Sheets connection
 # --------------------------------------------------------------------------------------
 def _require_secrets():
-    missing = []
     if "gcp_service_account" not in st.secrets:
-        missing.append("gcp_service_account")
-    if missing:
         st.error(
-            "Secrets missing: "
-            + ", ".join(missing)
-            + ". Add them in App → Settings → Secrets. "
-            "See docs for 'Streamlit Secrets'."
+            "Secrets missing: gcp_service_account. "
+            "App → Settings → Secrets এ আপনার service account JSON এবং SHEET_ID বসান।"
         )
         st.stop()
 
@@ -49,7 +43,7 @@ def _ws(name: str):
     try:
         return sheet.worksheet(name)
     except Exception:
-        st.error(f"Worksheet '{name}' not found. Please create it with correct headers.")
+        st.error(f"Worksheet '{name}' পাওয়া যায়নি। দয়া করে শিটে এই ট্যাবটি তৈরি করুন।")
         st.stop()
 
 voters_ws = _ws("voters")         # headers: name | email | token | used | used_at
@@ -57,9 +51,9 @@ candidates_ws = _ws("candidates") # headers: position | candidate
 votes_ws = _ws("votes")           # headers: position | candidate | timestamp
 
 # --------------------------------------------------------------------------------------
-# Election meta helpers (persisted in a sheet called 'election_meta')
+# Election meta helpers (persisted in 'election_meta')
 # --------------------------------------------------------------------------------------
-ELECTION_META_SHEET = "election_meta"  # key | value
+ELECTION_META_SHEET = "election_meta"  # columns: key | value
 
 def ensure_meta_sheet():
     try:
@@ -70,8 +64,8 @@ def ensure_meta_sheet():
         default = [
             ["name", ""],
             ["status", "idle"],      # idle | ongoing | ended | published
-            ["start_utc", ""],       # ISO8601
-            ["end_utc", ""],         # ISO8601
+            ["start_utc", ""],       # ISO8601 (UTC)
+            ["end_utc", ""],         # ISO8601 (UTC)
             ["published", "FALSE"],
             ["election_id", ""],
         ]
@@ -87,19 +81,25 @@ def read_meta():
 def set_meta(key: str, value: str):
     ws = ensure_meta_sheet()
     recs = ws.get_all_records()
-    for i, r in enumerate(recs, start=2):  # +1 for header, +1 for 1-based index
+    for i, r in enumerate(recs, start=2):  # +1 header, +1 one-based
         if r.get("key") == key:
             ws.update_cell(i, 2, value)
             return
     ws.append_row([key, value], value_input_option="RAW")
 
 def now_utc():
-    return datetime.utcnow().replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+def to_utc_iso(dt_obj: datetime) -> str:
+    """Coerce any datetime (naive/aware) to UTC ISO string."""
+    if dt_obj.tzinfo is None:
+        # treat input as UTC if naive
+        return dt_obj.replace(tzinfo=timezone.utc).isoformat()
+    return dt_obj.astimezone(timezone.utc).isoformat()
 
 def is_voting_open():
     meta, _ = read_meta()
-    status = meta.get("status", "idle")
-    if status != "ongoing":
+    if meta.get("status", "idle") != "ongoing":
         return False
     start = meta.get("start_utc", "")
     end = meta.get("end_utc", "")
@@ -109,11 +109,10 @@ def is_voting_open():
     except Exception:
         return False
     now = now_utc()
-    if start_dt and now < start_dt.replace(tzinfo=timezone.utc):
+    if start_dt and now < start_dt.astimezone(timezone.utc):
         return False
-    if end_dt and now > end_dt.replace(tzinfo=timezone.utc):
-        # auto-end if passed
-        set_meta("status", "ended")
+    if end_dt and now > end_dt.astimezone(timezone.utc):
+        set_meta("status", "ended")  # auto-end if passed
         return False
     return True
 
@@ -125,19 +124,17 @@ def load_voters_df():
     df = pd.DataFrame(voters_ws.get_all_records())
     if df.empty:
         df = pd.DataFrame(columns=["name", "email", "token", "used", "used_at"])
-    # normalize headers -> ensure expected columns exist
     cols_lower = {c.strip().lower(): c for c in df.columns}
-    for needed in ["name", "email", "token", "used", "used_at"]:
-        if needed not in cols_lower:
-            df[needed] = "" if needed in ["name", "email", "token", "used_at"] else False
-    # select in correct order
+    # ensure expected columns
+    for col in ["name", "email", "token", "used", "used_at"]:
+        if col not in cols_lower:
+            df[col] = "" if col in ["name", "email", "token", "used_at"] else False
     df = df[[cols_lower.get("name", "name"),
              cols_lower.get("email", "email"),
              cols_lower.get("token", "token"),
              cols_lower.get("used", "used"),
              cols_lower.get("used_at", "used_at")]]
     df.columns = ["name", "email", "token", "used", "used_at"]
-    # clean & normalize
     df["token"] = df["token"].astype(str).str.strip()
     df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
     return df
@@ -147,7 +144,6 @@ def load_candidates_df():
     df = pd.DataFrame(candidates_ws.get_all_records())
     if df.empty:
         df = pd.DataFrame(columns=["position", "candidate"])
-    # try normalize
     if "position" not in df.columns or "candidate" not in df.columns:
         cols_lower = {c.strip().lower(): c for c in df.columns}
         df = df[[cols_lower.get("position", "position"), cols_lower.get("candidate", "candidate")]]
@@ -170,20 +166,19 @@ def clear_caches():
     load_votes_df.clear()
 
 # --------------------------------------------------------------------------------------
-# Sheet operations
+# Sheet ops
 # --------------------------------------------------------------------------------------
 def mark_token_used(df_voters: pd.DataFrame, token: str):
     token_clean = str(token).strip()
     m = df_voters[df_voters["token"] == token_clean]
     if m.empty:
         return
-    row_index = m.index[0] + 2  # +2 => header is row 1, DataFrame is 0-based
-    voters_ws.update_cell(row_index, 4, "TRUE")  # 'used'
-    voters_ws.update_cell(row_index, 5, now_utc().isoformat())  # 'used_at'
+    row_index = m.index[0] + 2  # +2 => header row + 1-based
+    voters_ws.update_cell(row_index, 4, "TRUE")                          # used
+    voters_ws.update_cell(row_index, 5, now_utc().isoformat())           # used_at
     load_voters_df.clear()
 
 def append_votes(rows):
-    # rows: [[position, candidate, timestamp], ...]
     if rows:
         votes_ws.append_rows(rows, value_input_option="RAW")
         load_votes_df.clear()
@@ -191,12 +186,12 @@ def append_votes(rows):
 def generate_tokens(count: int, prefix: str):
     import secrets, string
     alpha = string.ascii_uppercase + string.digits
-    out = []
+    rows = []
     for _ in range(count):
         t = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
-        out.append(["", "", t, "FALSE", ""])
-    if out:
-        voters_ws.append_rows(out, value_input_option="RAW")
+        rows.append(["", "", t, "FALSE", ""])
+    if rows:
+        voters_ws.append_rows(rows, value_input_option="RAW")
         load_voters_df.clear()
 
 def archive_and_clear_votes(election_name: str = None):
@@ -207,13 +202,11 @@ def archive_and_clear_votes(election_name: str = None):
     safe_name = (election_name or "election").replace(" ", "_")[:20]
     archive_title = f"votes_archive_{safe_name}_{ts}"
     new_ws = sheet.add_worksheet(title=archive_title, rows=len(votes) + 5, cols=5)
-    # header
     new_ws.update("A1:C1", [["position", "candidate", "timestamp"]])
     new_ws.append_rows(
         [[v["position"], v["candidate"], v["timestamp"]] for v in votes],
         value_input_option="RAW",
     )
-    # clear current votes sheet (keep worksheet & header)
     votes_ws.clear()
     votes_ws.append_row(["position", "candidate", "timestamp"], value_input_option="RAW")
     load_votes_df.clear()
@@ -300,7 +293,7 @@ with tab_results:
 with tab_admin:
     st.subheader("🛠️ Admin Tools")
 
-    # Optional password
+    # Optional password protection
     admin_ok = True
     admin_pwd = st.secrets.get("ADMIN_PASSWORD")
     if admin_pwd:
@@ -310,7 +303,6 @@ with tab_admin:
             st.error("Wrong password")
 
     if admin_ok:
-        # Election control
         st.markdown("### 🗓️ Election control")
         meta, _ = read_meta()
         st.markdown(f"- **Current election name:** `{meta.get('name','(none)')}`")
@@ -321,18 +313,24 @@ with tab_admin:
 
         st.divider()
         st.markdown("#### Create / Schedule new election")
-        ename = st.text_input("Election name", value=meta.get("name", ""))
+
+        # ✅ Use UTC-aware defaults for datetime_input
+        default_start = datetime.now(timezone.utc)
+        default_end = datetime.now(timezone.utc)
+
         c1, c2 = st.columns(2)
-        start_dt = c1.datetime_input("Start (UTC)", value=datetime.utcnow())
-        end_dt = c2.datetime_input("End (UTC)", value=datetime.utcnow())
+        start_dt = c1.datetime_input("Start (UTC)", value=default_start)
+        end_dt   = c2.datetime_input("End (UTC)", value=default_end)
+
+        ename = st.text_input("Election name", value=meta.get("name", ""))
 
         if st.button("Set & Schedule"):
             set_meta("name", ename)
-            set_meta("start_utc", start_dt.replace(tzinfo=timezone.utc).isoformat())
-            set_meta("end_utc", end_dt.replace(tzinfo=timezone.utc).isoformat())
+            set_meta("start_utc", to_utc_iso(start_dt))
+            set_meta("end_utc", to_utc_iso(end_dt))
             set_meta("status", "idle")
             set_meta("published", "FALSE")
-            st.success("Election scheduled. Press 'Start Election Now' at the right time (or wait).")
+            st.success("Election scheduled. সময় হলে 'Start Election Now' চাপুন বা অটো-উইন্ডোতে শুরু হবে।")
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
@@ -346,13 +344,12 @@ with tab_admin:
         if c5.button("Publish Results (declare)"):
             set_meta("published", "TRUE")
             set_meta("status", "ended")
-            st.success("Results published. You can now export or archive votes.")
+            st.success("Results published. Export/Archive করতে পারেন।")
 
         st.divider()
-        # Token generator
         st.markdown("### 🔑 Token Generator")
         g1, g2 = st.columns(2)
-        count = g1.number_input("কতটি টোকেন?", min_value=1, value=20, step=10)  # unlimited (no max)
+        count = g1.number_input("কতটি টোকেন?", min_value=1, value=20, step=10)  # no max
         prefix = g2.text_input("Prefix", value="BYWOB-2025")
         if st.button("➕ Generate & Append"):
             try:
