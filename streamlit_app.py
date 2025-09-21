@@ -1,36 +1,25 @@
-# BYWOB Online Voting — Streamlit + Google Sheets
-# - Uses google-auth (no oauth2client)
-# - CET/CEST (Europe/Paris) time; stores start/end in CET
-# - Server-wide cache + exponential backoff to reduce 429s
-# - One-screen voting (all positions), live results, full admin tools
+# streamlit_app.py
 
-import time
-from datetime import datetime, timedelta
+import random
+import string
+from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo
-
 import pandas as pd
 import streamlit as st
 import gspread
-from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
+from streamlit_autorefresh import st_autorefresh
 
-# ------------- App & Timezone -------------
-LOCAL_TZ = ZoneInfo("Europe/Paris")  # CET/CEST
-st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
-st.title("🗳️ BYWOB Online Voting")
-st.caption("Streamlit + Google Sheets • One-time tokens • Timezone: CET/CEST (Europe/Paris)")
+# ------------------------------------------------------------------------------
+# App Config
+# ------------------------------------------------------------------------------
+st.set_page_config(page_title="BYWOB Voting", page_icon="🗳️", layout="wide")
+CET = ZoneInfo("Europe/Paris")
+LIVE_REFRESH_SEC = 15  # Auto refresh interval (seconds). Keep >= 10 to avoid API quota hits.
 
-# ------------- Quota-friendly cache TTLs -------------
-LIVE_REFRESH_SEC = 30    # Results auto-refresh interval (when toggled ON)
-TTL_VOTERS_SEC   = 600   # voters cache 10 min
-TTL_CANDS_SEC    = 600   # candidates cache 10 min
-TTL_VOTES_SEC    = 60    # votes cache 1 min
-
-# ------------- Secrets & Auth -------------
-if "gcp_service_account" not in st.secrets:
-    st.error("Secrets missing: [gcp_service_account]. App Settings → Secrets-এ Service Account JSON + SHEET_ID দিন।")
-    st.stop()
-
+# ------------------------------------------------------------------------------
+# Google Sheets Connect (modern creds)
+# ------------------------------------------------------------------------------
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -39,468 +28,434 @@ sa_info = dict(st.secrets["gcp_service_account"])
 creds: Credentials = Credentials.from_service_account_info(sa_info, scopes=scope)
 client = gspread.authorize(creds)
 
+SHEET_ID = st.secrets["gcp_service_account"]["SHEET_ID"]
+
+def open_sheet():
+    return client.open_by_key(SHEET_ID)
+
+# ------------------------------------------------------------------------------
+# Helpers: ensure worksheets & headers
+# ------------------------------------------------------------------------------
+def ensure_worksheet(sh, title, headers=None, rows=1000, cols=20):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
+        if headers:
+            ws.update("A1", [headers])
+    else:
+        if headers:
+            # If empty, write headers
+            values = ws.get_all_values()
+            if len(values) == 0:
+                ws.update("A1", [headers])
+    return ws
+
+def setup_structure():
+    sh = open_sheet()
+    ensure_worksheet(sh, "meta", ["key", "value"])
+    ensure_worksheet(sh, "positions", ["position"])
+    ensure_worksheet(sh, "candidates", ["position", "candidate"])
+    ensure_worksheet(sh, "voters", ["name", "email", "token", "used", "used_at"])
+    ensure_worksheet(sh, "votes", ["election_name", "position", "candidate", "token", "timestamp_cet"])
+    ensure_worksheet(sh, "results", ["position", "candidate", "votes"])
+    return sh
+
+def meta_get_all(sh):
+    ws = sh.worksheet("meta")
+    rows = ws.get_all_records()
+    return {r["key"]: r["value"] for r in rows}
+
+def meta_set(sh, key, value):
+    ws = sh.worksheet("meta")
+    rows = ws.get_all_records()
+    d = {r["key"]: r["value"] for r in rows}
+    d[key] = value
+    # rewrite from scratch (simple)
+    ws.clear()
+    ws.update("A1", [["key","value"]]+[[k, d[k]] for k in d])
+
+def meta_bulk_set(sh, kv: dict):
+    ws = sh.worksheet("meta")
+    rows = ws.get_all_records()
+    d = {r["key"]: r["value"] for r in rows}
+    d.update(kv)
+    ws.clear()
+    ws.update("A1", [["key","value"]]+[[k, d[k]] for k in d])
+
+def read_df(sh, tab):
+    ws = sh.worksheet(tab)
+    vals = ws.get_all_values()
+    if not vals:
+        return pd.DataFrame()
+    df = pd.DataFrame(vals[1:], columns=vals[0])
+    return df
+
+def write_results_from_votes(sh):
+    """Aggregate votes -> results sheet."""
+    votes = read_df(sh, "votes")
+    if votes.empty:
+        df = pd.DataFrame(columns=["position","candidate","votes"])
+    else:
+        grp = votes.groupby(["position","candidate"]).size().reset_index(name="votes")
+        df = grp.sort_values(["position","votes"], ascending=[True, False])
+    ws = sh.worksheet("results")
+    ws.clear()
+    ws.update("A1", [df.columns.tolist()] + df.values.tolist() if not df.empty else [["position","candidate","votes"]])
+
+def validate_token(sh, token_str):
+    voters = read_df(sh, "voters")
+    if voters.empty:
+        return False, None
+    # Clean compare
+    t = token_str.strip()
+    row = voters[voters["token"].str.strip().str.upper() == t.upper()]
+    if row.empty:
+        return False, None
+    used = str(row.iloc[0].get("used","")).strip().lower()
+    if used in ("true","1","yes","y"):
+        return False, None
+    return True, row.index[0]  # return the dataframe index (0-based excluding header)
+
+def mark_token_used(sh, df_index):
+    ws = sh.worksheet("voters")
+    # gspread rows start at 1, header at 1, so index in df + 2
+    row_num = df_index + 2
+    used_col = 4
+    used_at_col = 5
+    now_cet = datetime.now(CET).isoformat()
+    ws.update_cell(row_num, used_col, "TRUE")
+    ws.update_cell(row_num, used_at_col, now_cet)
+
+def generate_tokens(count: int, prefix: str):
+    tokens = []
+    for _ in range(count):
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        tokens.append(f"{prefix}{suffix}")
+    return tokens
+
+# ------------------------------------------------------------------------------
+# UI: Header & Tabs
+# ------------------------------------------------------------------------------
+st.title("🗳️ BYWOB Voting Platform")
+
+with st.sidebar:
+    st.markdown("**Service Account:**")
+    st.code(st.secrets["gcp_service_account"]["client_email"], language=None)
+    st.markdown("**Project:**")
+    st.code(st.secrets["gcp_service_account"]["project_id"], language=None)
+    st.markdown("**Sheet ID:**")
+    st.code(SHEET_ID, language=None)
+
 try:
-    SHEET_ID = st.secrets["gcp_service_account"]["SHEET_ID"]
-    sheet = client.open_by_key(SHEET_ID)
+    sh = setup_structure()
+    api_ok = True
 except Exception as e:
-    st.error(f"❌ Google Sheet ওপেন করা যায়নি: {e}")
-    st.stop()
+    api_ok = False
+    st.error(f"❌ Google Sheet ওপেন করা যায়নি: {type(e).__name__}: {e}")
 
-# ------------- Worksheet helpers -------------
-def ensure_ws(title: str, headers: list[str], rows: int = 100, cols: int = 10):
-    try:
-        ws = sheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=title, rows=rows, cols=cols)
-        end_col = chr(64 + len(headers))
-        ws.update(range_name=f"A1:{end_col}1", values=[headers])
-    return sheet.worksheet(title)
+tabs = st.tabs(["Vote", "Results", "Admin"])
 
-meta_ws       = ensure_ws("meta", ["key", "value"], rows=20, cols=2)
-voters_ws     = ensure_ws("voters", ["name", "email", "token", "used", "used_at"], rows=2000, cols=5)
-candidates_ws = ensure_ws("candidates", ["position", "candidate"], rows=500, cols=2)
-votes_ws      = ensure_ws("votes", ["position", "candidate", "timestamp"], rows=5000, cols=3)
-
-# ------------- Safe read with backoff -------------
-def safe_get_all_records(ws, max_retries=5, base_sleep=1.0):
-    """429/Quota exceeded এলে exponential backoff সহ রিট্রাই করবে."""
-    for i in range(max_retries):
-        try:
-            return ws.get_all_records()
-        except APIError as e:
-            msg = str(e)
-            if "429" in msg or "Quota exceeded" in msg:
-                time.sleep(base_sleep * (2 ** i))  # 1s,2s,4s,8s,16s
-                continue
-            raise
-    return ws.get_all_records()
-
-# ------------- Meta helpers -------------
-def now_local() -> datetime:
-    return datetime.now(LOCAL_TZ)
-
-def meta_get_all() -> dict:
-    recs = safe_get_all_records(meta_ws)
-    return {r.get("key"): r.get("value") for r in recs if r.get("key")}
-
-def meta_set(key: str, value: str):
-    recs = meta_ws.get_all_records()
-    for i, r in enumerate(recs, start=2):
-        if r.get("key") == key:
-            meta_ws.update_cell(i, 2, value)
-            return
-    meta_ws.append_row([key, value], value_input_option="RAW")
-
-# defaults (first run + backward compatibility)
-_m = meta_get_all()
-if "status" not in _m:     meta_set("status", "idle")
-if "name" not in _m:       meta_set("name", "")
-if "start_utc" in _m and "start_cet" not in _m:
-    meta_set("start_cet", _m.get("start_utc"))
-    meta_set("end_cet", _m.get("end_utc", ""))
-if "start_cet" not in _m:  meta_set("start_cet", "")
-if "end_cet" not in _m:    meta_set("end_cet", "")
-if "published" not in _m:  meta_set("published", "FALSE")
-
-def parse_iso_local_or_none(s: str | None):
-    if not s: return None
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=LOCAL_TZ)
-        return dt.astimezone(LOCAL_TZ)
-    except Exception:
-        return None
-
-def is_voting_open() -> bool:
-    m = meta_get_all()
-    if m.get("status", "idle") != "ongoing":
-        return False
-    start_dt = parse_iso_local_or_none(m.get("start_cet"))
-    end_dt   = parse_iso_local_or_none(m.get("end_cet"))
-    now = now_local()
-    if start_dt and now < start_dt:
-        return False
-    if end_dt and now > end_dt:
-        meta_set("status", "ended")
-        return False
-    return True
-
-# ------------- Server-wide sheet cache -------------
-@st.cache_resource
-def get_sheet_cache():
-    from dataclasses import dataclass
-    from time import time as _time
-
-    @dataclass
-    class _Item:
-        df: pd.DataFrame | None
-        ts: float
-
-    class SheetCache:
-        def __init__(self):
-            self._voters = _Item(None, 0.0)
-            self._cands  = _Item(None, 0.0)
-            self._votes  = _Item(None, 0.0)
-
-        def _expired(self, last_ts: float, ttl: int) -> bool:
-            return (_time() - last_ts) > ttl
-
-        def voters_df(self) -> pd.DataFrame:
-            import pandas as _pd
-            if self._voters.df is None or self._expired(self._voters.ts, TTL_VOTERS_SEC):
-                df = _pd.DataFrame(safe_get_all_records(voters_ws))
-                if df.empty:
-                    df = _pd.DataFrame(columns=["name","email","token","used","used_at"])
-                for c in ["name","email","token","used","used_at"]:
-                    if c not in df.columns: df[c] = ""
-                df["token"] = df["token"].astype(str).str.strip()
-                df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
-                self._voters = _Item(df, _time())
-            return self._voters.df
-
-        def candidates_df(self) -> pd.DataFrame:
-            import pandas as _pd
-            if self._cands.df is None or self._expired(self._cands.ts, TTL_CANDS_SEC):
-                df = _pd.DataFrame(safe_get_all_records(candidates_ws))
-                if df.empty:
-                    df = _pd.DataFrame(columns=["position","candidate"])
-                for c in ["position","candidate"]:
-                    if c not in df.columns: df[c] = ""
-                df["position"]  = df["position"].astype(str).str.strip()
-                df["candidate"] = df["candidate"].astype(str).str.strip()
-                df = df[(df["position"]!="") & (df["candidate"]!="")]
-                self._cands = _Item(df[["position","candidate"]], _time())
-            return self._cands.df
-
-        def votes_df(self) -> pd.DataFrame:
-            import pandas as _pd
-            if self._votes.df is None or self._expired(self._votes.ts, TTL_VOTES_SEC):
-                df = _pd.DataFrame(safe_get_all_records(votes_ws))
-                if df.empty:
-                    df = _pd.DataFrame(columns=["position","candidate","timestamp"])
-                self._votes = _Item(df[["position","candidate","timestamp"]], _time())
-            return self._votes.df
-
-        def invalidate_voters(self): self._voters.ts = 0.0
-        def invalidate_cands(self):  self._cands.ts  = 0.0
-        def invalidate_votes(self):  self._votes.ts  = 0.0
-
-    return SheetCache()
-
-SHEET_CACHE = get_sheet_cache()
-
-def load_voters_df():     return SHEET_CACHE.voters_df()
-def load_candidates_df(): return SHEET_CACHE.candidates_df()
-def load_votes_df():      return SHEET_CACHE.votes_df()
-def clear_caches():
-    SHEET_CACHE.invalidate_voters()
-    SHEET_CACHE.invalidate_cands()
-    SHEET_CACHE.invalidate_votes()
-
-# ------------- Sheet writes -------------
-def mark_token_used(voters_df: pd.DataFrame, token: str):
-    t = str(token).strip()
-    m = voters_df[voters_df["token"] == t]
-    if m.empty: return
-    row_idx = m.index[0] + 2
-    voters_ws.update_cell(row_idx, 4, "TRUE")
-    voters_ws.update_cell(row_idx, 5, now_local().isoformat())  # CET timestamp
-    SHEET_CACHE.invalidate_voters()
-
-def append_vote_rows(rows: list[list[str]]):
-    if rows:
-        votes_ws.append_rows(rows, value_input_option="RAW")
-        SHEET_CACHE.invalidate_votes()
-
-def generate_tokens(n: int, prefix: str):
-    import secrets, string
-    alpha = string.ascii_uppercase + string.digits
-    rows = []
-    for _ in range(int(n)):
-        tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
-        rows.append(["","",tok,"FALSE",""])
-    if rows:
-        voters_ws.append_rows(rows, value_input_option="RAW")
-        SHEET_CACHE.invalidate_voters()
-
-def archive_votes(election_name: str | None):
-    rows = safe_get_all_records(votes_ws)
-    if not rows: return None
-    ts = now_local().strftime("%Y%m%dT%H%M%S%z")
-    safe = (election_name or "election").replace(" ", "_")[:20]
-    title = f"votes_archive_{safe}_{ts}"
-    new_ws = sheet.add_worksheet(title=title, rows=len(rows)+5, cols=3)
-    new_ws.update(range_name="A1:C1", values=[["position","candidate","timestamp"]])
-    new_ws.append_rows([[r["position"], r["candidate"], r["timestamp"]] for r in rows], value_input_option="RAW")
-    return title
-
-def clear_votes_sheet():
-    votes_ws.clear()
-    votes_ws.append_row(["position","candidate","timestamp"], value_input_option="RAW")
-    SHEET_CACHE.invalidate_votes()
-
-def reset_all_tokens():
-    df = load_voters_df()
-    if df.empty: return 0
-    for i in range(len(df)):
-        row_idx = i + 2
-        voters_ws.update_cell(row_idx, 4, "FALSE")
-        voters_ws.update_cell(row_idx, 5, "")
-    SHEET_CACHE.invalidate_voters()
-    return len(df)
-
-def results_df():
-    df = load_votes_df()
-    if df.empty:
-        return pd.DataFrame(columns=["position","candidate","votes"])
-    out = df.groupby(["position","candidate"]).size().reset_index(name="votes")
-    return out.sort_values(["position","votes"], ascending=[True, False])
-
-# ------------- UI Tabs -------------
-tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "🔑 Admin"])
-
-# ------------- Vote (all positions together) -------------
-with tab_vote:
-    st.subheader("ভোট দিন (টোকেন ব্যবহার করে)")
-    token = st.text_input("আপনার টোকেন লিখুন", placeholder="BYWOB-2025-XXXXXX")
-
-    if st.button("Proceed"):
-        if not token:
-            st.error("টোকেন দিন।"); st.stop()
-
-        if not is_voting_open():
-            m = meta_get_all()
-            st.error(
-                "এখন ভোট গ্রহণ করা হচ্ছে না।\n\n"
-                f"Status: {m.get('status','idle')}\n"
-                f"Start (CET): {m.get('start_cet','')}\n"
-                f"End (CET): {m.get('end_cet','')}"
-            ); st.stop()
-
-        voters = load_voters_df()
-        row = voters[voters["token"] == token.strip()]
-        if row.empty: st.error("❌ টোকেন সঠিক নয়।"); st.stop()
-        if row["used_bool"].iloc[0]: st.error("⚠️ এই টোকেনটি ইতিমধ্যে ব্যবহার করা হয়েছে।"); st.stop()
-
-        cands = load_candidates_df()
-        if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।"); st.stop()
-
-        positions = sorted(cands["position"].unique().tolist())
-        pos_to_cands = {p: cands[cands["position"] == p]["candidate"].tolist() for p in positions}
-
-        st.markdown("### সব পদের জন্য আপনার পছন্দ বাছাই করুন")
-        with st.form("all_positions_form", clear_on_submit=False):
-            selections = {}
-            for p in positions:
-                selections[p] = st.radio(f"**{p}**", options=pos_to_cands[p], index=0, key=f"pick_{p}")
-            submitted = st.form_submit_button("✅ Submit All Votes")
-
-        if submitted:
-            rows = []
-            ts = now_local().isoformat()  # CET timestamp
-            for p, cand in selections.items():
-                if cand and cand.strip():
-                    rows.append([p, cand, ts])
-
-            if not rows:
-                st.error("কমপক্ষে একটি পদের জন্য প্রার্থী সিলেক্ট করুন।"); st.stop()
-
-            append_vote_rows(rows)
-            mark_token_used(voters, token)
-            st.success("আপনার সব ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
-
-# ------------- Results -------------
-with tab_results:
-    st.subheader("📊 Live Results")
-
-    auto = st.toggle(f"Auto refresh every {LIVE_REFRESH_SEC}s", value=False)
-    if auto:
-        st.autorefresh(interval=LIVE_REFRESH_SEC * 1000, key="auto_refresh_key")
-
-    c1, _ = st.columns([1, 3])
-    if c1.button("🔄 Refresh now"):
-        clear_caches()
-        st.rerun()
-
-    r = results_df()
-    if r.empty:
-        st.info("এখনও কোনো ভোট পড়েনি।")
+# ------------------------------------------------------------------------------
+# VOTE TAB
+# ------------------------------------------------------------------------------
+with tabs[0]:
+    st.header("🗳️ Vote")
+    if not api_ok:
+        st.info("Sheets API ঠিক না হওয়া পর্যন্ত ভোট দেওয়া যাবে না।")
     else:
-        st.dataframe(r, width="stretch")
+        meta = meta_get_all(sh)
+        status = meta.get("status","pending").lower()
+        ename = meta.get("name","(unnamed)")
+        # Time window check
+        now_cet = datetime.now(CET)
+        start_str = meta.get("start_cet","")
+        end_str = meta.get("end_cet","")
+        def parse_dt(s):
+            try:
+                return datetime.fromisoformat(s)
+            except:
+                return None
+        start_dt = parse_dt(start_str)
+        end_dt = parse_dt(end_str)
 
-# ------------- Admin -------------
-with tab_admin:
-    st.subheader("🛠️ Admin Tools")
+        st.markdown(f"**Election:** `{ename}`  •  **Status:** `{status}`")
+        if start_dt: st.caption(f"Starts: {start_dt} CET")
+        if end_dt:   st.caption(f"Ends  : {end_dt} CET")
 
-    # Optional password
-    ok = True
-    pw_secret = st.secrets.get("ADMIN_PASSWORD")
-    if pw_secret:
-        given = st.text_input("Admin password", type="password")
-        ok = (given == pw_secret)
-        if given and not ok: st.error("Wrong password")
-    if not ok:
-        st.warning("Please enter admin password to continue.")
-        st.stop()
+        # Gate by time/status
+        allowed = False
+        if status == "ongoing":
+            allowed = True
+        elif status in ("scheduled","pending"):
+            if start_dt and start_dt <= now_cet and (not end_dt or now_cet <= end_dt):
+                allowed = True
+        elif status == "ended":
+            allowed = False
 
-    # Diagnostics (which SA/project is running)
-    with st.expander("🔎 Diagnostics (Service Account)"):
-        try:
-            st.write("**Service Account Email:**", creds.service_account_email)
-        except Exception:
-            st.write("**Service Account Email:** (unavailable)")
-        st.write("**Configured Project ID:**", st.secrets["gcp_service_account"].get("project_id"))
-        st.write("**Key ID:**", st.secrets["gcp_service_account"].get("private_key_id"))
-        try:
-            st.success(f"Sheets API reachable ✅ (Spreadsheet: {sheet.title})")
-        except Exception as e:
-            st.error(f"Sheets API error: {e}")
-
-    m = meta_get_all()
-    start_dt_meta = parse_iso_local_or_none(m.get("start_cet"))
-    end_dt_meta   = parse_iso_local_or_none(m.get("end_cet"))
-    now_ = now_local()
-
-    st.markdown("### 🗓️ Election control")
-    st.markdown(f"- **Current election name:** `{m.get('name','(none)')}`")
-    st.markdown(f"- **Status:** `{m.get('status','idle')}`")
-    st.markdown(f"- **Start (CET):** `{m.get('start_cet','')}`")
-    st.markdown(f"- **End (CET):** `{m.get('end_cet','')}`")
-    st.markdown(f"- **Published:** `{m.get('published','FALSE')}`")
-
-    st.divider()
-    st.markdown("#### Create / Schedule new election (CET/CEST)")
-
-    c1, c2 = st.columns(2)
-    start_date_default = (start_dt_meta or now_).date()
-    end_date_default   = (end_dt_meta   or now_).date()
-    start_time_default = (start_dt_meta or now_).time().replace(microsecond=0)
-    end_time_default   = (end_dt_meta   or now_).time().replace(microsecond=0)
-
-    start_date = c1.date_input("Start date (CET)", value=start_date_default)
-    end_date   = c2.date_input("End date (CET)",   value=end_date_default)
-
-    mode = st.radio("Time input mode",
-                    ["Picker (recommended)", "Manual (type HH:MM or HH:MM:SS)"],
-                    horizontal=True)
-
-    if mode == "Picker (recommended)":
-        start_time = c1.time_input("Start time (CET)", value=start_time_default,
-                                   step=timedelta(minutes=1))
-        end_time   = c2.time_input("End time (CET)",   value=end_time_default,
-                                   step=timedelta(minutes=1))
-    else:
-        st.caption("Tip: 24h format, যেমন 09:05 বা 09:05:30")
-        cc1, cc2 = st.columns(2)
-        s_str = cc1.text_input("Start time (CET) — manual", value=start_time_default.strftime("%H:%M:%S"))
-        e_str = cc2.text_input("End time (CET) — manual",   value=end_time_default.strftime("%H:%M:%S"))
-        def _p(s):
-            for fmt in ("%H:%M:%S", "%H:%M"):
-                try: return datetime.strptime(s.strip(), fmt).time()
-                except ValueError: pass
-            raise ValueError("Invalid time format. Use HH:MM or HH:MM:SS")
-        try:
-            start_time = _p(s_str); end_time = _p(e_str)
-        except ValueError as e:
-            st.error(str(e)); st.stop()
-
-    start_dt = datetime.combine(start_date, start_time).replace(tzinfo=LOCAL_TZ)
-    end_dt   = datetime.combine(end_date,   end_time).replace(tzinfo=LOCAL_TZ)
-    ename = st.text_input("Election name", value=m.get("name",""))
-
-    if st.button("Set & Schedule"):
-        meta_set("name", ename)
-        meta_set("start_cet", start_dt.isoformat())
-        meta_set("end_cet", end_dt.isoformat())
-        meta_set("status", "idle")
-        meta_set("published", "FALSE")
-        st.success(f"Election scheduled (CET).\nStart: {start_dt.isoformat()}\nEnd: {end_dt.isoformat()}")
-        st.rerun()
-
-    c3, c4, c5 = st.columns(3)
-    if c3.button("Start Election Now"):
-        meta_set("status", "ongoing")
-        meta_set("start_cet", now_.isoformat())
-        st.success("Election started. Start time set to now (CET).")
-        st.rerun()
-
-    if c4.button("End Election Now"):
-        meta_set("status", "ended")
-        meta_set("end_cet", now_.isoformat())
-        st.success("Election ended. End time set to now (CET).")
-        st.rerun()
-
-    if c5.button("Publish Results (declare)"):
-        meta_set("published", "TRUE"); meta_set("status", "ended")
-        st.success("Results published.")
-        st.rerun()
-
-    st.divider()
-    st.markdown("### 🔄 Start New Election (Archive & Reset)")
-    st.caption("আগের ভোটগুলো আলাদা শিটে সংরক্ষণ হবে, votes ক্লিয়ার হবে, সব টোকেন আবার ব্যবহারযোগ্য হবে।")
-    if st.button("Archive previous votes & reset tokens"):
-        archived_title = archive_votes(meta_get_all().get("name","election"))
-        clear_votes_sheet()
-        n = reset_all_tokens()
-        if archived_title:
-            st.success(f"Votes archived to sheet: {archived_title}")
+        if not allowed:
+            st.warning("⏳ এখন ভোটিং উইন্ডো খোলা নেই। সময়/স্ট্যাটাস চেক করুন।")
         else:
-            st.info("No previous votes to archive.")
-        st.success(f"Tokens reset: {n} rows updated (used=FALSE).")
+            # Token
+            token = st.text_input("Enter your voting token")
+            proceed = st.button("Proceed")
+            if proceed:
+                valid, df_index = validate_token(sh, token)
+                if not valid:
+                    st.error("❌ Invalid or already used token.")
+                else:
+                    # Load positions & candidates
+                    pos_df = read_df(sh, "positions")
+                    cand_df = read_df(sh, "candidates")
+                    if pos_df.empty or cand_df.empty:
+                        st.error("পদের তালিকা বা প্রার্থীদের তালিকা খালি। Admin ট্যাব থেকে যোগ করুন।")
+                    else:
+                        st.success("✅ Token OK. Please select your choices below.")
+                        with st.form("full_ballot"):
+                            selections = {}
+                            # show all positions together
+                            for _, row in pos_df.iterrows():
+                                p = row["position"].strip()
+                                cands = cand_df[cand_df["position"].str.strip() == p]["candidate"].tolist()
+                                if not cands:
+                                    st.warning(f"'{p}' পদের জন্য কোন প্রার্থী নেই।")
+                                    continue
+                                choice = st.radio(f"Position: {p}", options=cands, horizontal=True)
+                                selections[p] = choice
+                            submitted = st.form_submit_button("Submit All Votes")
+                            if submitted:
+                                # Write one row per position
+                                ws_votes = sh.worksheet("votes")
+                                timestamp_cet = datetime.now(CET).isoformat()
+                                rows_to_add = []
+                                for p, c in selections.items():
+                                    rows_to_add.append([ename, p, c, token.strip(), timestamp_cet])
+                                if rows_to_add:
+                                    ws_votes.append_rows(rows_to_add)
+                                    mark_token_used(sh, df_index)
+                                    write_results_from_votes(sh)
+                                    st.success("✅ Your vote has been recorded.")
+                                else:
+                                    st.error("কোনো নির্বাচন করা হয়নি।")
 
-    st.divider()
-    st.markdown("### 🔑 Token Generator")
-    g1, g2 = st.columns(2)
-    count  = g1.number_input("কতটি টোকেন?", min_value=1, value=20, step=10)
-    prefix = g2.text_input("Prefix", value="BYWOB-2025")
-    if st.button("➕ Generate & Append"):
-        try:
-            generate_tokens(int(count), prefix)
-            st.success(f"{int(count)}টি টোকেন voters শিটে যোগ হয়েছে।")
-        except Exception as e:
-            st.error(f"টোকেন তৈরি ব্যর্থ: {e}")
-
-    st.markdown("### 👥 Voters (tokens hidden)")
-    vdf = load_voters_df()
-    if vdf.empty:
-        st.info("কোনো ভোটার নেই।")
+# ------------------------------------------------------------------------------
+# RESULTS TAB
+# ------------------------------------------------------------------------------
+with tabs[1]:
+    st.header("📊 Results (Live)")
+    if not api_ok:
+        st.info("Sheets API ঠিক না হওয়া পর্যন্ত ফলাফল দেখা যাবে না।")
     else:
-        safe = vdf.copy(); safe["token"] = "••••••••"
-        st.dataframe(safe[["name","email","token","used","used_at"]], width="stretch")
+        auto = st.toggle(f"Auto refresh every {LIVE_REFRESH_SEC}s", value=False,
+                         help="Auto refresh চালু করলে API কোটায় চাপ পড়তে পারে।")
+        if auto:
+            st_autorefresh(interval=LIVE_REFRESH_SEC * 1000, key="auto_refresh")
 
-    st.markdown("### 📋 Candidates")
-    cdf = load_candidates_df()
-    if cdf.empty:
-        st.info("candidates শিট ফাঁকা। position, candidate কলামসহ ডেটা দিন।")
-    else:
-        st.dataframe(cdf, width="stretch")
+        c1, _ = st.columns([1, 3])
+        if c1.button("🔄 Refresh now"):
+            st.rerun()
 
-    st.markdown("### 📈 Tally (by position)")
-    vts = load_votes_df()
-    if vts.empty:
-        st.info("এখনও কোনো ভোট পড়েনি।")
-    else:
-        for pos in cdf["position"].unique():
-            grp = (
-                vts[vts["position"] == pos]
-                .groupby("candidate").size().reset_index(name="votes")
-                .sort_values("votes", ascending=False)
-            )
-            if not grp.empty:
-                st.markdown(f"**{pos}**")
-                st.table(grp.set_index("candidate"))
+        # load from 'results' (already aggregated)
+        res_df = read_df(sh, "results")
+        if res_df.empty:
+            st.info("এখনো কোনো ভোট পড়েনি বা ফলাফল তৈরি হয়নি। Admin ট্যাব থেকে Tally/Refresh দিন।")
+        else:
+            st.dataframe(res_df, use_container_width=True)
 
-    st.divider()
-    st.markdown("### ⬇️ Export results (CSV)")
-    res = results_df()
-    if res.empty:
-        st.info("No votes yet.")
+        st.divider()
+        st.caption("টিপ: খুব ঘনঘন রিফ্রেশ করবেন না—429 quota exceeded এড়াতে।")
+
+# ------------------------------------------------------------------------------
+# ADMIN TAB
+# ------------------------------------------------------------------------------
+with tabs[2]:
+    st.header("👨‍💻 Admin")
+    if not api_ok:
+        st.info("Sheets API ফিক্স করুন—Secrets/Permissions/Sheet ID চেক করুন।")
     else:
-        st.download_button(
-            "Download results CSV",
-            data=res.to_csv(index=False).encode("utf-8"),
-            file_name=f"results_{meta_get_all().get('name','election')}.csv",
-            mime="text/csv",
-        )
+        meta = meta_get_all(sh)
+        st.subheader("Election Setup (CET)")
+        # Existing values
+        ename = st.text_input("Election name", value=meta.get("name","BYWOB Election"))
+
+        # Date & time pickers (separate inputs)
+        now_cet = datetime.now(CET)
+        default_start_date = date.fromisoformat(meta.get("start_date_cet", now_cet.date().isoformat()))
+        default_end_date   = date.fromisoformat(meta.get("end_date_cet",   (now_cet + timedelta(days=1)).date().isoformat()))
+        def parse_time(s, fallback):
+            try:
+                hh, mm = s.split(":")
+                return time(int(hh), int(mm))
+            except:
+                return fallback
+
+        default_start_time = parse_time(meta.get("start_time_cet", "09:00"), time(9,0))
+        default_end_time   = parse_time(meta.get("end_time_cet",   "18:00"), time(18,0))
+
+        c1, c2 = st.columns(2)
+        start_date = c1.date_input("Start date (CET)", value=default_start_date)
+        start_time = c1.time_input("Start time (CET)", value=default_start_time)  # step default (1 minute)
+        end_date   = c2.date_input("End date (CET)",   value=default_end_date)
+        end_time   = c2.time_input("End time (CET)",   value=default_end_time)
+
+        # Compose full datetimes
+        start_dt_cet = datetime.combine(start_date, start_time, tzinfo=CET)
+        end_dt_cet   = datetime.combine(end_date,   end_time,   tzinfo=CET)
+
+        st.write(f"**Start (CET):** {start_dt_cet}")
+        st.write(f"**End (CET):** {end_dt_cet}")
+
+        c3, c4, c5 = st.columns([1,1,2])
+        if c3.button("💾 Save Config"):
+            meta_bulk_set(sh, {
+                "name": ename,
+                "start_date_cet": start_date.isoformat(),
+                "start_time_cet": start_time.strftime("%H:%M"),
+                "end_date_cet": end_date.isoformat(),
+                "end_time_cet": end_time.strftime("%H:%M"),
+                "start_cet": start_dt_cet.isoformat(),
+                "end_cet": end_dt_cet.isoformat(),
+                "status": "scheduled"
+            })
+            st.success("Config saved (status=scheduled).")
+
+        if c4.button("▶️ Start Election Now"):
+            now_cet = datetime.now(CET)
+            # keep end as set, but set start to now, status ongoing
+            meta_bulk_set(sh, {
+                "name": ename,
+                "start_date_cet": now_cet.date().isoformat(),
+                "start_time_cet": now_cet.strftime("%H:%M"),
+                "start_cet": now_cet.isoformat(),
+                "status": "ongoing"
+            })
+            st.success(f"Election started at {now_cet} CET (status=ongoing).")
+
+        if c5.button("⏹ End Election Now"):
+            now_cet = datetime.now(CET)
+            meta_bulk_set(sh, {
+                "end_date_cet": now_cet.date().isoformat(),
+                "end_time_cet": now_cet.strftime("%H:%M"),
+                "end_cet": now_cet.isoformat(),
+                "status": "ended"
+            })
+            st.warning(f"Election ended at {now_cet} CET (status=ended).")
+
+        st.divider()
+        st.subheader("Positions & Candidates")
+        # Show editors
+        pos_df = read_df(sh, "positions")
+        cand_df = read_df(sh, "candidates")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**positions**")
+            st.dataframe(pos_df if not pos_df.empty else pd.DataFrame(columns=["position"]), use_container_width=True)
+        with c2:
+            st.markdown("**candidates**")
+            st.dataframe(cand_df if not cand_df.empty else pd.DataFrame(columns=["position","candidate"]), use_container_width=True)
+
+        with st.expander("➕ Quick add"):
+            c1, c2, c3 = st.columns([2,2,1])
+            new_pos = c1.text_input("Add position")
+            if c3.button("Add position"):
+                if new_pos.strip():
+                    sh.worksheet("positions").append_row([new_pos.strip()])
+                    st.success("Position added.")
+                    st.rerun()
+            new_pos2 = c1.selectbox("Position for candidate", options=(pos_df["position"].tolist() if not pos_df.empty else []))
+            new_cand = c2.text_input("Candidate name")
+            if c3.button("Add candidate"):
+                if new_pos2 and new_cand.strip():
+                    sh.worksheet("candidates").append_row([new_pos2, new_cand.strip()])
+                    st.success("Candidate added.")
+                    st.rerun()
+
+        st.divider()
+        st.subheader("Voters & Tokens")
+        voters_df = read_df(sh, "voters")
+        st.dataframe(voters_df if not voters_df.empty else pd.DataFrame(columns=["name","email","token","used","used_at"]),
+                     use_container_width=True)
+
+        with st.expander("🔑 Token Generator"):
+            t1, t2, t3 = st.columns([1,1,1])
+            count = t1.number_input("How many", min_value=1, max_value=2000, value=50, step=10)
+            prefix = t2.text_input("Prefix", value="BYWOB-2025-")
+            do_gen = t3.button("Generate & Append")
+            if do_gen:
+                toks = generate_tokens(count, prefix)
+                rows = [[ "", "", tok, "FALSE", "" ] for tok in toks]
+                sh.worksheet("voters").append_rows(rows)
+                st.success(f"{len(toks)} tokens appended.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Tally & Export")
+        c1, c2, c3 = st.columns([1,1,2])
+        if c1.button("🧮 Recompute tally"):
+            write_results_from_votes(sh)
+            st.success("Results recomputed from votes.")
+        if c2.button("📤 Export results CSV"):
+            res_df = read_df(sh, "results")
+            if res_df.empty:
+                st.info("Results empty.")
+            else:
+                csv = res_df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download results.csv", data=csv, file_name="results.csv", mime="text/csv")
+
+        st.divider()
+        st.subheader("Archive & Reset")
+        a1, a2 = st.columns([1,2])
+        if a1.button("📦 Archive previous votes & reset tokens"):
+            # Archive votes -> new worksheet, clear votes, reset voters.used
+            ts = datetime.now(CET).strftime("%Y%m%d_%H%M%S")
+            votes_df = read_df(sh, "votes")
+            archive_title = f"votes_archive_{ts}"
+            if votes_df.empty:
+                st.info("No votes to archive.")
+            else:
+                ws_arch = sh.add_worksheet(archive_title, rows=2, cols=max(5, votes_df.shape[1]))
+                ws_arch.update("A1", [votes_df.columns.tolist()] + votes_df.values.tolist())
+                # Clear votes
+                sh.worksheet("votes").clear()
+                sh.worksheet("votes").update("A1", [["election_name","position","candidate","token","timestamp_cet"]])
+            # reset voters
+            vws = sh.worksheet("voters")
+            vals = vws.get_all_values()
+            if vals:
+                # overwrite used & used_at to FALSE/""
+                header = vals[0]
+                used_idx = header.index("used")
+                used_at_idx = header.index("used_at")
+                for r in range(1, len(vals)):
+                    if len(vals[r]) < len(header):
+                        vals[r] += [""]*(len(header)-len(vals[r]))
+                    vals[r][used_idx] = "FALSE"
+                    vals[r][used_at_idx] = ""
+                vws.clear()
+                vws.update("A1", vals)
+            st.success("Archived old votes & reset tokens.")
+
+        st.divider()
+        with st.expander("🧰 Diagnostics"):
+            st.write("**Service Account:**", st.secrets["gcp_service_account"]["client_email"])
+            st.write("**Project ID:**", st.secrets["gcp_service_account"]["project_id"])
+            try:
+                # simple ping
+                _ = sh.worksheets()
+                st.success("Sheets API reachable ✅")
+            except Exception as e:
+                st.error(f"Sheets API problem: {e}")
+
+        st.divider()
+        with st.expander("📋 Operator Guide"):
+            st.markdown("""
+**দ্রুত গাইড (CET):**
+1. `positions` ও `candidates` ট্যাব পূরণ করুন।  
+2. Token Generator থেকে টোকেন বানান (voters শিটে যাবে)।  
+3. Election name + Start/End (CET) সেট করে **Save Config** দিন।  
+4. সময় হলে নিজে থেকেই ভোট খুলবে, না হলে **Start Election Now** চাপুন।  
+5. ভোট চলাকালীন **Results** ট্যাবে **Refresh** বা **Auto refresh** ব্যবহার করুন।  
+6. শেষ হলে **End Election Now** দিন (বা সময় শেষ হলে বন্ধ হবে)।  
+7. ফলাফল **Export results CSV** দিয়ে নামিয়ে রাখুন।  
+8. নতুন নির্বাচন শুরুর আগে **Archive previous votes & reset tokens** দিন।
+            """)
