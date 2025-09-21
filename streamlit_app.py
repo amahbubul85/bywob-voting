@@ -189,7 +189,7 @@ def load_candidates_df():
         df = pd.DataFrame(columns=["position", "candidate"])
     for col in ["position", "candidate"]:
         if col not in df.columns: df[col] = ""
-    df["position"] = df["position"].astype(str).str.strip()
+    df["position"] = df["position"].astype(str().str.strip()
     df["candidate"] = df["candidate"].astype(str).str.strip()
     df = df[(df["position"] != "") & (df["candidate"] != "")]
     return df[["position", "candidate"]]
@@ -362,43 +362,62 @@ with tab_admin:
         st.divider()
         st.markdown("#### Create / Schedule new election")
 
-        now_ = now_utc()
-        c1, c2 = st.columns(2)
-
-        # Start inputs (date+time, UTC)
-        start_date = c1.date_input("Start date (UTC)", value=now_.date())
-        start_time = c1.time_input("Start time (UTC)", value=now_.time().replace(microsecond=0))
-
-        # End inputs
-        end_date = c2.date_input("End date (UTC)", value=now_.date())
-        end_time = c2.time_input("End time (UTC)", value=now_.time().replace(microsecond=0))
-
-        start_dt = datetime.combine(start_date, start_time).replace(tzinfo=timezone.utc)
-        end_dt   = datetime.combine(end_date, end_time).replace(tzinfo=timezone.utc)
-
+        # সরলীকৃত সময় নির্বাচন - শুধুমাত্র লোকাল তারিখ এবং সময়
         ename = st.text_input("Election name", value=m.get("name",""))
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Start Time**")
+            start_date = st.date_input("Start date", value=datetime.now().date(), key="start_date")
+            start_time = st.time_input("Start time", value=datetime.now().time().replace(second=0, microsecond=0), key="start_time")
+        
+        with col2:
+            st.markdown("**End Time**")
+            end_date = st.date_input("End date", value=datetime.now().date(), key="end_date")
+            end_time = st.time_input("End time", value=(datetime.now().time().replace(second=0, microsecond=0)), key="end_time")
+        
+        # লোকাল তারিখ এবং সময়কে UTC-তে রূপান্তর
+        start_dt_local = datetime.combine(start_date, start_time)
+        end_dt_local = datetime.combine(end_date, end_time)
+        
+        # UTC-তে রূপান্তর
+        start_dt_utc = start_dt_local.astimezone(timezone.utc)
+        end_dt_utc = end_dt_local.astimezone(timezone.utc)
+        
+        st.info(f"**সময়সূচী:**\n- শুরু: {start_dt_local.strftime('%Y-%m-%d %H:%M')} (লোকাল)\n- শেষ: {end_dt_local.strftime('%Y-%m-%d %H:%M')} (লোকাল)")
 
         if st.button("Set & Schedule"):
             meta_set("name", ename)
-            meta_set("start_utc", start_dt.isoformat())
-            meta_set("end_utc", end_dt.isoformat())
+            meta_set("start_utc", start_dt_utc.isoformat())
+            meta_set("end_utc", end_dt_utc.isoformat())
             meta_set("status", "idle")
             meta_set("published", "FALSE")
-            st.success("Election scheduled.")
+            st.success("Election scheduled successfully!")
+            st.rerun()
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
+            # বর্তমান সময় থেকে শুরু এবং 24 ঘন্টা পরে শেষ
+            start_now = datetime.now(timezone.utc)
+            end_now = start_now.replace(hour=23, minute=59, second=0)  # আজ রাত 11:59 পর্যন্ত
+            
+            meta_set("start_utc", start_now.isoformat())
+            meta_set("end_utc", end_now.isoformat())
             meta_set("status", "ongoing")
-            st.success("Election started (status = ongoing).")
+            st.success("Election started now! Will end at midnight.")
+            st.rerun()
 
         if c4.button("End Election Now"):
             meta_set("status", "ended")
-            st.success("Election ended (status = ended).")
+            st.success("Election ended now.")
+            st.rerun()
 
         if c5.button("Publish Results (declare)"):
             meta_set("published", "TRUE")
             meta_set("status", "ended")
-            st.success("Results published. Export/Archive করতে পারেন।")
+            st.success("Results published. You can now export/archive.")
+            st.rerun()
 
         st.divider()
         st.markdown("### 🔑 Token Generator")
@@ -409,6 +428,7 @@ with tab_admin:
             try:
                 generate_tokens(int(count), prefix)
                 st.success(f"{int(count)}টি টোকেন voters শিটে যোগ হয়েছে।")
+                st.rerun()
             except Exception as e:
                 st.error(f"টোকেন তৈরি ব্যর্থ: {e}")
 
@@ -467,5 +487,6 @@ with tab_admin:
                 st.info("No votes to archive.")
             else:
                 st.success(f"Votes archived to sheet: {res}")
+            st.rerun()
     else:
         st.warning("Please enter admin password to continue.")
