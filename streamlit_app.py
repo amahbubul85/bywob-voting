@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import secrets, string
+import secrets, string, math
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️")
 st.title("🗳️ BYWOB Online Voting")
@@ -25,7 +25,7 @@ votes_ws = sheet.worksheet("votes")
 PLACEHOLDER = "— একজন প্রার্থী নির্বাচন করুন —"
 
 # ---------------------------
-# Loaders
+# Loaders (clean + safe)
 # ---------------------------
 @st.cache_data
 def load_voters():
@@ -80,17 +80,22 @@ def save_vote_batch(selections, positions):
     votes_ws.append_rows(rows, value_input_option="RAW")
 
 def ballot_form(cands, positions):
+    """সব পদের রেডিও এক পেজে; সব সিলেক্ট না হলে Submit নিষ্ক্রিয়।"""
     selections = {}
     with st.form("ballot_form"):
-        st.info("প্রতিটি পদের জন্য একজন প্রার্থী নির্বাচন করুন, তারপর Submit ক্লিক করুন।")
+        st.info("প্রতিটি পদের জন্য একজন প্রার্থী নির্বাচন করুন, তারপর নিচের Submit বাটনে ক্লিক করুন।")
         for pos in positions:
             subset = cands[cands["position"] == pos]["candidate"].tolist()
             options = [PLACEHOLDER] + subset
             choice = st.radio(f"**{pos}**", options, index=0, key=f"radio_{pos}")
             selections[pos] = None if choice == PLACEHOLDER else choice
 
-        submitted = st.form_submit_button("✅ ভোট জমা দিন")
         missing = [p for p in positions if selections[p] is None]
+        can_submit = (len(missing) == 0)
+
+        # নতুন: সব সিলেক্ট না হলে বাটন disabled
+        submitted = st.form_submit_button("✅ ভোট জমা দিন", disabled=not can_submit)
+
         return submitted, selections, missing
 
 def tally(cands):
@@ -98,81 +103,3 @@ def tally(cands):
     if votes.empty:
         st.info("এখনও কোনো ভোট পড়েনি।")
         return
-    st.subheader("📊 Live Tally")
-    for pos in cands["position"].unique():
-        st.markdown(f"**{pos}**")
-        counts = votes[votes["position"] == pos]["candidate"].value_counts()
-        st.table(counts.rename("votes"))
-
-# ---------------------------
-# Token generator
-# ---------------------------
-def generate_token(prefix="BYWOB-2025", n=8):
-    alphabet = string.ascii_uppercase + string.digits
-    return f"{prefix}-" + "".join(secrets.choice(alphabet) for _ in range(n))
-
-def add_tokens(count, prefix="BYWOB-2025"):
-    rows = []
-    for _ in range(int(count)):
-        t = generate_token(prefix=prefix, n=8)
-        rows.append(["", "", t, False, ""])
-    if rows:
-        voters_ws.append_rows(rows, value_input_option="RAW")
-        load_voters.clear()
-
-# ---------------------------
-# Main UI
-# ---------------------------
-voters = load_voters()
-cands  = load_candidates()
-positions = sorted(pd.unique(cands["position"]))
-
-tab_vote, tab_admin = st.tabs(["🔐 Vote", "🛠️ Admin"])
-
-with tab_vote:
-    token = st.text_input("আপনার ওয়ান-টাইম টোকেন লিখুন", type="password")
-    if token:
-        rec, err = validate_token(voters, token.strip())
-        if err:
-            st.error(err)
-        else:
-            st.success(f"স্বাগতম, {rec['name']} — সব পদের জন্য ভোট দিন।")
-            submitted, selections, missing = ballot_form(cands, positions)
-            if submitted:
-                if len(missing) == 0:
-                    mark_token_used(token.strip())
-                    save_vote_batch(selections, positions)
-                    st.success("✅ আপনার ভোট গোপনে Google Sheets-এ সংরক্ষিত হয়েছে। ধন্যবাদ!")
-                else:
-                    st.error("❗ এই পজিশনগুলোতে নির্বাচন বাকি আছে: " + ", ".join(missing))
-
-with tab_admin:
-    st.caption("Admin ট্যাব (ADMIN_PASSWORD Secrets এ দিলে পাসওয়ার্ড লাগবে)")
-    ok = True
-    if ADMIN_PASSWORD:
-        pw = st.text_input("Admin password", type="password")
-        ok = (pw == ADMIN_PASSWORD)
-        if pw and not ok:
-            st.error("Wrong password")
-
-    if ok:
-        with st.expander("📋 Candidates"):
-            st.dataframe(cands)
-        with st.expander("🧑‍🤝‍🧑 Voters (tokens hidden)"):
-            if not voters.empty:
-                st.dataframe(voters.assign(token="••••••••"))
-            else:
-                st.info("কোনো ভোটার নেই।")
-        with st.expander("🔑 Token Generator"):
-            col1, col2 = st.columns(2)
-            with col1:
-                count = st.number_input("কতটি টোকেন?", min_value=1, max_value=2000, value=20, step=10)
-            with col2:
-                prefix = st.text_input("Prefix", value="BYWOB-2025")
-            if st.button("➕ Generate & Append"):
-                add_tokens(count, prefix=prefix)
-                st.success(f"{int(count)}টি টোকেন voters শিটে যোগ হয়েছে।")
-        with st.expander("📊 Live Tally"):
-            tally(cands)
-    else:
-        st.warning("Please enter admin password.")
