@@ -1,3 +1,4 @@
+
 # streamlit_app.py
 # BYWOB Online Voting — Streamlit + Google Sheets
 # - Auto-creates required worksheets with headers (meta, voters, candidates, votes)
@@ -265,4 +266,123 @@ with tab_admin:
             st.error("Wrong password")
 
     if admin_ok:
-        m = meta_get_all
+        m = meta_get_all()
+        st.markdown("### 🗓️ Election control")
+        st.markdown(f"- **Current election name:** `{m.get('name','(none)')}`")
+        st.markdown(f"- **Status:** `{m.get('status','idle')}`")
+        st.markdown(f"- **Start (UTC):** `{m.get('start_utc','')}`")
+        st.markdown(f"- **End (UTC):** `{m.get('end_utc','')}`")
+        st.markdown(f"- **Published:** `{m.get('published','FALSE')}`")
+
+        st.divider()
+        st.markdown("#### Create / Schedule new election")
+
+        now_ = now_utc()
+        c1, c2 = st.columns(2)
+
+        # Start inputs (date+time, UTC)
+        start_date = c1.date_input("Start date (UTC)", value=now_.date())
+        start_time = c1.time_input("Start time (UTC)", value=now_.time().replace(microsecond=0))
+
+        # End inputs
+        end_date = c2.date_input("End date (UTC)", value=now_.date())
+        end_time = c2.time_input("End time (UTC)", value=now_.time().replace(microsecond=0))
+
+        start_dt = datetime.combine(start_date, start_time).replace(tzinfo=timezone.utc)
+        end_dt   = datetime.combine(end_date, end_time).replace(tzinfo=timezone.utc)
+
+        ename = st.text_input("Election name", value=m.get("name",""))
+
+        if st.button("Set & Schedule"):
+            meta_set("name", ename)
+            meta_set("start_utc", start_dt.isoformat())
+            meta_set("end_utc", end_dt.isoformat())
+            meta_set("status", "idle")
+            meta_set("published", "FALSE")
+            st.success("Election scheduled.")
+
+        c3, c4, c5 = st.columns(3)
+        if c3.button("Start Election Now"):
+            meta_set("status", "ongoing")
+            st.success("Election started (status = ongoing).")
+
+        if c4.button("End Election Now"):
+            meta_set("status", "ended")
+            st.success("Election ended (status = ended).")
+
+        if c5.button("Publish Results (declare)"):
+            meta_set("published", "TRUE")
+            meta_set("status", "ended")
+            st.success("Results published. Export/Archive করতে পারেন।")
+
+        st.divider()
+        st.markdown("### 🔑 Token Generator")
+        g1, g2 = st.columns(2)
+        count = g1.number_input("কতটি টোকেন?", min_value=1, value=20, step=10)
+        prefix = g2.text_input("Prefix", value="BYWOB-2025")
+        if st.button("➕ Generate & Append"):
+            try:
+                generate_tokens(int(count), prefix)
+                st.success(f"{int(count)}টি টোকেন voters শিটে যোগ হয়েছে।")
+            except Exception as e:
+                st.error(f"টোকেন তৈরি ব্যর্থ: {e}")
+
+        st.markdown("### 👥 Voters (tokens hidden)")
+        voters_df = load_voters_df()
+        if voters_df.empty:
+            st.info("কোনো ভোটার নেই।")
+        else:
+            safe = voters_df.copy()
+            safe["token"] = "••••••••"
+            st.dataframe(safe[["name","email","token","used","used_at"]], width="stretch")
+
+        st.markdown("### 📋 Candidates")
+        cands_df = load_candidates_df()
+        if cands_df.empty:
+            st.info("candidates শিট ফাঁকা। position, candidate কলামসহ ডেটা দিন।")
+        else:
+            st.dataframe(cands_df, width="stretch")
+
+        st.markdown("### 📈 Tally (by position)")
+        vdf = load_votes_df()
+        if vdf.empty:
+            st.info("এখনও কোনো ভোট পড়েনি।")
+        else:
+            for pos in cands_df["position"].unique():
+                grp = (
+                    vdf[vdf["position"] == pos]
+                    .groupby("candidate")
+                    .size()
+                    .reset_index(name="votes")
+                    .sort_values("votes", ascending=False)
+                )
+                if not grp.empty:
+                    st.markdown(f"**{pos}**")
+                    st.table(grp.set_index("candidate"))
+
+        st.divider()
+        st.markdown("### ⬇️ Export results")
+        r = results_df()
+        if r.empty:
+            st.info("No votes yet.")
+        else:
+            csv_bytes = r.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download results CSV",
+                data=csv_bytes,
+                file_name=f"results_{meta_get_all().get('name','election')}.csv",
+                mime="text/csv",
+            )
+
+        st.markdown("### 🗄️ Archive & Clear")
+        if st.button("Archive votes and clear (prepare new)"):
+            name_for_archive = meta_get_all().get("name","election")
+            res = archive_and_clear_votes(name_for_archive)
+            if res == "no_votes":
+                st.info("No votes to archive.")
+            else:
+                st.success(f"Votes archived to sheet: {res}")
+    else:
+        st.warning("Please enter admin password to continue.")
+
+
