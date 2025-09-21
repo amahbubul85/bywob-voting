@@ -289,6 +289,7 @@ def results_df():
 tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "🔑 Admin"])
 
 # ------------------------ Vote Tab ------------------------
+# ------------------------ Vote Tab ------------------------
 with tab_vote:
     # অটোরিফ্রেশ সেটআপ (প্রতি 30 সেকেন্ডে)
     if is_voting_open():
@@ -325,18 +326,45 @@ with tab_vote:
 
         cands = load_candidates_df()
         if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে प्रার্থী যোগ করুন।")
+            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।")
             st.stop()
 
+        # Show all positions and candidates as radio buttons
+        st.markdown("### সকল পদ এবং প্রার্থী")
+        
+        # Create a dictionary to store selections
+        if 'votes' not in st.session_state:
+            st.session_state.votes = {}
+        
+        # Display each position with its candidates as radio buttons
         positions = cands["position"].unique().tolist()
-        pos = st.radio("পদের নাম বাছাই করুন", positions, index=0)
-        opts = cands[cands["position"] == pos]["candidate"].tolist()
-        cand = st.radio("প্রার্থীর নাম বাছাই করুন", opts, index=0)
-
-        if st.button("✅ Submit Vote"):
-            append_vote(pos, cand)
-            mark_token_used(voters, token)
-            st.success("আপনার ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
+        for position in positions:
+            st.markdown(f"#### {position}")
+            candidates = cands[cands["position"] == position]["candidate"].tolist()
+            selected_candidate = st.radio(
+                f"{position} এর জন্য প্রার্থী নির্বাচন করুন:",
+                candidates,
+                key=position,
+                index=None
+            )
+            st.session_state.votes[position] = selected_candidate
+        
+        if st.button("✅ Submit All Votes"):
+            # Check if all positions have a selection
+            missing_positions = [pos for pos, cand in st.session_state.votes.items() if cand is None]
+            
+            if missing_positions:
+                st.error(f"দয়া করে নিম্নলিখিত পদগুলির জন্য ভোট দিন: {', '.join(missing_positions)}")
+            else:
+                # Submit votes for all positions
+                for position, candidate in st.session_state.votes.items():
+                    append_vote(position, candidate)
+                
+                mark_token_used(voters, token)
+                st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
+                # Clear the session state
+                st.session_state.votes = {}
+                st.rerun()
 
 # ------------------------ Results Tab ------------------------
 with tab_results:
