@@ -2,8 +2,9 @@
 # - One-screen voting (all positions together)
 # - Auto-create worksheets (meta, voters, candidates, votes)
 # - Election window (UTC): idle | ongoing | ended | published
-# - Archive old votes and start a fresh election (reset tokens)
-# - Token generator, live tally, CSV export
+# - Start/End now buttons update schedule fields and UI immediately
+# - Archive old votes & reset tokens for new round
+# - Token generator, live tally (ttl), CSV export, manual refresh
 
 import streamlit as st
 import pandas as pd
@@ -70,20 +71,25 @@ if "start_utc" not in _m:  meta_set("start_utc", "")
 if "end_utc" not in _m:    meta_set("end_utc", "")
 if "published" not in _m:  meta_set("published", "FALSE")
 
+def parse_iso_or_none(s: str | None):
+    if not s: return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 def is_voting_open() -> bool:
     m = meta_get_all()
     if m.get("status", "idle") != "ongoing":
         return False
-    try:
-        s = m.get("start_utc", "")
-        e = m.get("end_utc", "")
-        start_dt = datetime.fromisoformat(s) if s else None
-        end_dt   = datetime.fromisoformat(e) if e else None
-    except Exception:
-        return False
+    start_dt = parse_iso_or_none(m.get("start_utc"))
+    end_dt   = parse_iso_or_none(m.get("end_utc"))
     now = now_utc()
-    if start_dt and now < start_dt.astimezone(timezone.utc): return False
-    if end_dt and now > end_dt.astimezone(timezone.utc):
+    if start_dt and now < start_dt: return False
+    if end_dt and now > end_dt:
         meta_set("status", "ended")
         return False
     return True
@@ -112,7 +118,7 @@ def load_candidates_df():
     df = df[(df["position"]!="") & (df["candidate"]!="")]
     return df[["position","candidate"]]
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=5)  # ← Live-ish refresh
 def load_votes_df():
     df = pd.DataFrame(votes_ws.get_all_records())
     if df.empty:
@@ -133,7 +139,6 @@ def mark_token_used(voters_df: pd.DataFrame, token: str):
     load_voters_df.clear()
 
 def append_vote_rows(rows: list[list[str]]):
-    # rows: [[position, candidate, timestamp], ...]
     if rows:
         votes_ws.append_rows(rows, value_input_option="RAW")
         load_votes_df.clear()
@@ -240,6 +245,13 @@ with tab_vote:
 # --------------------------- Results ---------------------------
 with tab_results:
     st.subheader("📊 Live Results")
+
+    # Manual refresh
+    rcol1, rcol2 = st.columns([1,3])
+    if rcol1.button("🔄 Refresh now"):
+        clear_caches()
+        st.rerun()
+
     r = results_df()
     if r.empty:
         st.info("এখনও কোনো ভোট পড়েনি।")
@@ -262,6 +274,10 @@ with tab_admin:
         st.warning("Please enter admin password to continue.")
     else:
         m = meta_get_all()
+        start_dt_meta = parse_iso_or_none(m.get("start_utc"))
+        end_dt_meta   = parse_iso_or_none(m.get("end_utc"))
+        now_ = now_utc()
+
         st.markdown("### 🗓️ Election control")
         st.markdown(f"- **Current election name:** `{m.get('name','(none)')}`")
         st.markdown(f"- **Status:** `{m.get('status','idle')}`")
@@ -272,26 +288,30 @@ with tab_admin:
         st.divider()
         st.markdown("#### Create / Schedule new election")
 
-        now_ = now_utc()
         c1, c2 = st.columns(2)
-        start_date = c1.date_input("Start date (UTC)", value=now_.date())
-        end_date   = c2.date_input("End date (UTC)",   value=now_.date())
+        # Prefill from meta if available, otherwise now
+        start_date_default = (start_dt_meta or now_).date()
+        end_date_default   = (end_dt_meta   or now_).date()
+        start_time_default = (start_dt_meta or now_).time().replace(microsecond=0)
+        end_time_default   = (end_dt_meta   or now_).time().replace(microsecond=0)
+
+        start_date = c1.date_input("Start date (UTC)", value=start_date_default)
+        end_date   = c2.date_input("End date (UTC)",   value=end_date_default)
 
         mode = st.radio("Time input mode",
                         ["Picker (recommended)", "Manual (type HH:MM or HH:MM:SS)"],
                         horizontal=True)
 
         if mode == "Picker (recommended)":
-            start_time = c1.time_input("Start time (UTC)", value=now_.time().replace(microsecond=0),
-                                    step=timedelta(minutes=1))
-            end_time   = c2.time_input("End time (UTC)",   value=now_.time().replace(microsecond=0),
-                                    step=timedelta(minutes=1))
-
+            start_time = c1.time_input("Start time (UTC)", value=start_time_default,
+                                       step=timedelta(minutes=1))  # Streamlit requires >= 60s
+            end_time   = c2.time_input("End time (UTC)",   value=end_time_default,
+                                       step=timedelta(minutes=1))
         else:
             st.caption("Tip: 24h format, যেমন 09:05 বা 09:05:30")
             cc1, cc2 = st.columns(2)
-            s_str = cc1.text_input("Start time (UTC) — manual", value=now_.strftime("%H:%M:%S"))
-            e_str = cc2.text_input("End time (UTC) — manual",   value=now_.strftime("%H:%M:%S"))
+            s_str = cc1.text_input("Start time (UTC) — manual", value=start_time_default.strftime("%H:%M:%S"))
+            e_str = cc2.text_input("End time (UTC) — manual",   value=end_time_default.strftime("%H:%M:%S"))
             def _p(s):
                 for fmt in ("%H:%M:%S", "%H:%M"):
                     try: return datetime.strptime(s.strip(), fmt).time()
@@ -314,14 +334,27 @@ with tab_admin:
             meta_set("status", "idle")
             meta_set("published", "FALSE")
             st.success(f"Election scheduled.\nStart: {start_dt.isoformat()}\nEnd: {end_dt.isoformat()}")
+            st.rerun()  # reflect new times immediately
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
-            meta_set("status", "ongoing"); st.success("Election started.")
+            # set status ongoing and bump start_utc to now
+            meta_set("status", "ongoing")
+            meta_set("start_utc", now_.isoformat())
+            st.success("Election started. Start time set to now (UTC).")
+            st.rerun()  # update inputs & status immediately
+
         if c4.button("End Election Now"):
-            meta_set("status", "ended"); st.success("Election ended.")
+            # set status ended and bump end_utc to now
+            meta_set("status", "ended")
+            meta_set("end_utc", now_.isoformat())
+            st.success("Election ended. End time set to now (UTC).")
+            st.rerun()
+
         if c5.button("Publish Results (declare)"):
-            meta_set("published", "TRUE"); meta_set("status", "ended"); st.success("Results published.")
+            meta_set("published", "TRUE"); meta_set("status", "ended")
+            st.success("Results published.")
+            st.rerun()
 
         st.divider()
         st.markdown("### 🔄 Start New Election (Archive & Reset)")
