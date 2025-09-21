@@ -189,7 +189,7 @@ def load_candidates_df():
         df = pd.DataFrame(columns=["position", "candidate"])
     for col in ["position", "candidate"]:
         if col not in df.columns: df[col] = ""
-    df["position"] = df["position"].astype(str().str.strip()
+    df["position"] = df["position"].astype(str).str.strip()  # Fixed syntax error here
     df["candidate"] = df["candidate"].astype(str).str.strip()
     df = df[(df["position"] != "") & (df["candidate"] != "")]
     return df[["position", "candidate"]]
@@ -315,7 +315,7 @@ with tab_vote:
 
         cands = load_candidates_df()
         if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।")
+            st.warning("candidates শিট ফাঁকা। Admin ट্যাব থেকে প্রার্থী যোগ করুন।")
             st.stop()
 
         positions = cands["position"].unique().tolist()
