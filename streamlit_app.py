@@ -196,7 +196,7 @@ def load_candidates_df():
         return candidates_ws.get_all_records()
     df = pd.DataFrame(safe_sheet_operation(get_records))
     if df.empty:
-        df = pd.DataFrame(columns=["position", "candidate")
+        df = pd.DataFrame(columns=["position", "candidate"])
     for col in ["position", "candidate"]:
         if col not in df.columns: df[col] = ""
     df["position"] = df["position"].astype(str).str.strip()
