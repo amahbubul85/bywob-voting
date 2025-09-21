@@ -283,9 +283,10 @@ with tab_admin:
 
         if mode == "Picker (recommended)":
             start_time = c1.time_input("Start time (UTC)", value=now_.time().replace(microsecond=0),
-                                       step=timedelta(seconds=1))
+                                    step=timedelta(minutes=1))
             end_time   = c2.time_input("End time (UTC)",   value=now_.time().replace(microsecond=0),
-                                       step=timedelta(seconds=1))
+                                    step=timedelta(minutes=1))
+
         else:
             st.caption("Tip: 24h format, যেমন 09:05 বা 09:05:30")
             cc1, cc2 = st.columns(2)
