@@ -38,7 +38,7 @@ def to_cet(dt):
 # --------------------------------------------------------------------------------------
 def rate_limited(max_per_minute):
     """API কল রেট লিমিটার ডেকোরেটর"""
-    min_interval = 60.0 / max_per_minute
+    min_interval = 60.0 / max_per minute
     
     def decorator(func):
         last_called = [0.0]
@@ -404,14 +404,23 @@ with tab_admin:
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
-            # বর্তমান CET সময় থেকে শুরু এবং আজ মধ্যরাত পর্যন্ত
-            start_now = datetime.now(CET)
-            end_now = start_now.replace(hour=23, minute=59, second=0)  # আজ রাত 11:59 CET পর্যন্ত
+            # Use the scheduled times if they exist, otherwise use current time to midnight
+            start_cet = m.get("start_cet", "")
+            end_cet = m.get("end_cet", "")
             
-            meta_set("start_cet", start_now.isoformat())
-            meta_set("end_cet", end_now.isoformat())
-            meta_set("status", "ongoing")
-            st.success("Election started now! Will end at midnight CET.")
+            if start_cet and end_cet:
+                # Use the already scheduled times
+                meta_set("status", "ongoing")
+                st.success("Election started using scheduled times!")
+            else:
+                # বর্তমান CET সময় থেকে শুরু এবং আজ মধ্যরাত পর্যন্ত
+                start_now = datetime.now(CET)
+                end_now = start_now.replace(hour=23, minute=59, second=0)  # আজ রাত 11:59 CET পর্যন্ত
+                
+                meta_set("start_cet", start_now.isoformat())
+                meta_set("end_cet", end_now.isoformat())
+                meta_set("status", "ongoing")
+                st.success("Election started now! Will end at midnight CET.")
             st.rerun()
 
         if c4.button("End Election Now"):
