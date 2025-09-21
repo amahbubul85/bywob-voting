@@ -38,7 +38,7 @@ def to_cet(dt):
 # --------------------------------------------------------------------------------------
 def rate_limited(max_per_minute):
     """API কল রেট লিমিটার ডেকোরেটর"""
-    min_interval = 60.0 / max_per minute
+    min_interval = 60.0 / max_per_minute
     
     def decorator(func):
         last_called = [0.0]
@@ -196,7 +196,7 @@ def load_candidates_df():
         return candidates_ws.get_all_records()
     df = pd.DataFrame(safe_sheet_operation(get_records))
     if df.empty:
-        df = pd.DataFrame(columns=["position", "candidate"])
+        df = pd.DataFrame(columns=["position", "candidate")
     for col in ["position", "candidate"]:
         if col not in df.columns: df[col] = ""
     df["position"] = df["position"].astype(str).str.strip()
@@ -325,7 +325,7 @@ with tab_vote:
 
         cands = load_candidates_df()
         if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।")
+            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে प्रার্থী যোগ করুন।")
             st.stop()
 
         positions = cands["position"].unique().tolist()
