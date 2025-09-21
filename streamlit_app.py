@@ -1,4 +1,3 @@
-
 # streamlit_app.py
 # BYWOB Online Voting — Streamlit + Google Sheets
 # - Auto-creates required worksheets with headers (meta, voters, candidates, votes)
@@ -14,10 +13,40 @@ import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timezone
+import time
+from functools import wraps
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time tokens")
+
+# --------------------------------------------------------------------------------------
+# API Rate Limiting Decorator
+# --------------------------------------------------------------------------------------
+def rate_limited(max_per_minute):
+    """API কল রেট লিমিটার ডেকোরেটর"""
+    min_interval = 60.0 / max_per_minute
+    
+    def decorator(func):
+        last_called = [0.0]
+        
+        @wraps(func)
+        def rate_limited_function(*args, **kwargs):
+            elapsed = time.time() - last_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_called[0] = time.time()
+            return ret
+        return rate_limited_function
+    return decorator
+
+# প্রতি মিনিটে সর্বাধিক 60টি রিকোয়েস্ট (Google Sheets API সীমা)
+@rate_limited(60)
+def rate_limited_api_call(api_function, *args, **kwargs):
+    """রেট লিমিটেড API কল"""
+    return api_function(*args, **kwargs)
 
 # --------------------------------------------------------------------------------------
 # Secrets & Google Sheets connection
@@ -41,6 +70,20 @@ except Exception as e:
     st.stop()
 
 # --------------------------------------------------------------------------------------
+# Safe Sheet Operations with Retry Logic
+# --------------------------------------------------------------------------------------
+def safe_sheet_operation(operation, max_retries=3, delay_seconds=2):
+    """API কলগুলিতে রিট্রাই মেকানিজম যোগ করুন"""
+    for attempt in range(max_retries):
+        try:
+            return rate_limited_api_call(operation)
+        except Exception as e:
+            if ("quota" in str(e).lower() or "429" in str(e)) and attempt < max_retries - 1:
+                time.sleep(delay_seconds * (attempt + 1))
+                continue
+            raise e
+
+# --------------------------------------------------------------------------------------
 # Worksheet ensure/create helpers
 # --------------------------------------------------------------------------------------
 def ensure_ws(title: str, headers: list[str], rows: int = 100, cols: int = 10):
@@ -48,10 +91,14 @@ def ensure_ws(title: str, headers: list[str], rows: int = 100, cols: int = 10):
     try:
         ws = sheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=title, rows=rows, cols=cols)
+        def create_ws():
+            return sheet.add_worksheet(title=title, rows=rows, cols=cols)
+        ws = safe_sheet_operation(create_ws)
         # write headers in row 1
-        rng = f"A1:{chr(64+len(headers))}1"
-        ws.update(values=[headers], range_name=rng)
+        def update_headers():
+            rng = f"A1:{chr(64+len(headers))}1"
+            ws.update(values=[headers], range_name=rng)
+        safe_sheet_operation(update_headers)
     return sheet.worksheet(title)
 
 # Create or fetch all required sheets
@@ -67,18 +114,26 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 def meta_get_all() -> dict:
-    recs = meta_ws.get_all_records()
+    def get_records():
+        return meta_ws.get_all_records()
+    recs = safe_sheet_operation(get_records)
     return {r.get("key"): r.get("value") for r in recs if r.get("key")}
 
 def meta_set(key: str, value: str):
-    recs = meta_ws.get_all_records()
+    def get_records():
+        return meta_ws.get_all_records()
+    recs = safe_sheet_operation(get_records)
     # find existing key row (1-based with header)
     for i, r in enumerate(recs, start=2):
         if r.get("key") == key:
-            meta_ws.update_cell(i, 2, value)
+            def update_cell():
+                meta_ws.update_cell(i, 2, value)
+            safe_sheet_operation(update_cell)
             return
     # append new
-    meta_ws.append_row([key, value], value_input_option="RAW")
+    def append_row():
+        meta_ws.append_row([key, value], value_input_option="RAW")
+    safe_sheet_operation(append_row)
 
 # Set defaults if first run
 _meta = meta_get_all()
@@ -108,11 +163,13 @@ def is_voting_open() -> bool:
     return True
 
 # --------------------------------------------------------------------------------------
-# Cached loaders
+# Cached loaders - আরও দীর্ঘ সময়ের জন্য ক্যাশিং
 # --------------------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)  # 5 মিনিট ক্যাশ
 def load_voters_df():
-    df = pd.DataFrame(voters_ws.get_all_records())
+    def get_records():
+        return voters_ws.get_all_records()
+    df = pd.DataFrame(safe_sheet_operation(get_records))
     if df.empty:
         df = pd.DataFrame(columns=["name", "email", "token", "used", "used_at"])
     # normalize
@@ -123,9 +180,11 @@ def load_voters_df():
     df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
     return df[["name", "email", "token", "used", "used_at", "used_bool"]]
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)  # 5 মিনিট ক্যাশ
 def load_candidates_df():
-    df = pd.DataFrame(candidates_ws.get_all_records())
+    def get_records():
+        return candidates_ws.get_all_records()
+    df = pd.DataFrame(safe_sheet_operation(get_records))
     if df.empty:
         df = pd.DataFrame(columns=["position", "candidate"])
     for col in ["position", "candidate"]:
@@ -135,9 +194,11 @@ def load_candidates_df():
     df = df[(df["position"] != "") & (df["candidate"] != "")]
     return df[["position", "candidate"]]
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)  # 5 মিনিট ক্যাশ
 def load_votes_df():
-    df = pd.DataFrame(votes_ws.get_all_records())
+    def get_records():
+        return votes_ws.get_all_records()
+    df = pd.DataFrame(safe_sheet_operation(get_records))
     if df.empty:
         df = pd.DataFrame(columns=["position", "candidate", "timestamp"])
     return df[["position", "candidate", "timestamp"]]
@@ -153,12 +214,19 @@ def mark_token_used(voters_df: pd.DataFrame, token: str):
     m = voters_df[voters_df["token"] == t]
     if m.empty: return
     row_idx = m.index[0] + 2  # header offset
-    voters_ws.update_cell(row_idx, 4, "TRUE")                    # used
-    voters_ws.update_cell(row_idx, 5, now_utc().isoformat())     # used_at
+    
+    def update_operation():
+        voters_ws.update_cell(row_idx, 4, "TRUE")                    # used
+        voters_ws.update_cell(row_idx, 5, now_utc().isoformat())     # used_at
+    
+    safe_sheet_operation(update_operation)
     load_voters_df.clear()
 
 def append_vote(position: str, candidate: str):
-    votes_ws.append_row([position, candidate, now_utc().isoformat()], value_input_option="RAW")
+    def append_operation():
+        votes_ws.append_row([position, candidate, now_utc().isoformat()], value_input_option="RAW")
+    
+    safe_sheet_operation(append_operation)
     load_votes_df.clear()
 
 def generate_tokens(n: int, prefix: str):
@@ -168,24 +236,35 @@ def generate_tokens(n: int, prefix: str):
     for _ in range(n):
         tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
         rows.append(["", "", tok, "FALSE", ""])
+    
     if rows:
-        votes = voters_ws.append_rows(rows, value_input_option="RAW")
+        def append_operation():
+            voters_ws.append_rows(rows, value_input_option="RAW")
+        
+        safe_sheet_operation(append_operation)
         load_voters_df.clear()
 
 def archive_and_clear_votes(election_name: str | None):
-    rows = votes_ws.get_all_records()
+    def get_records():
+        return votes_ws.get_all_records()
+    rows = safe_sheet_operation(get_records)
     if not rows:
         return "no_votes"
     ts = now_utc().strftime("%Y%m%dT%H%M%SZ")
     safe = (election_name or "election").replace(" ", "_")[:20]
     title = f"votes_archive_{safe}_{ts}"
-    new_ws = sheet.add_worksheet(title=title, rows=len(rows)+5, cols=3)
-    new_ws.update(values=[["position","candidate","timestamp"]], range_name="A1:C1")
-    new_ws.append_rows([[r["position"], r["candidate"], r["timestamp"]] for r in rows], value_input_option="RAW")
-    votes_ws.clear()
-    votes_ws.append_row(["position","candidate","timestamp"], value_input_option="RAW")
+    
+    def create_archive():
+        new_ws = sheet.add_worksheet(title=title, rows=len(rows)+5, cols=3)
+        new_ws.update(values=[["position","candidate","timestamp"]], range_name="A1:C1")
+        new_ws.append_rows([[r["position"], r["candidate"], r["timestamp"]] for r in rows], value_input_option="RAW")
+        votes_ws.clear()
+        votes_ws.append_row(["position","candidate","timestamp"], value_input_option="RAW")
+        return title
+    
+    result = safe_sheet_operation(create_archive)
     load_votes_df.clear()
-    return title
+    return result
 
 def results_df():
     df = load_votes_df()
@@ -201,6 +280,12 @@ tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "�
 
 # ------------------------ Vote Tab ------------------------
 with tab_vote:
+    # অটোরিফ্রেশ সেটআপ (প্রতি 30 সেকেন্ডে)
+    if is_voting_open():
+        st.markdown("""
+        <meta http-equiv="refresh" content="30">
+        """, unsafe_allow_html=True)
+    
     st.subheader("ভোট দিন (টোকেন ব্যবহার করে)")
     token = st.text_input("আপনার টোকেন লিখুন", placeholder="BYWOB-2025-XXXXXX")
 
@@ -384,5 +469,3 @@ with tab_admin:
                 st.success(f"Votes archived to sheet: {res}")
     else:
         st.warning("Please enter admin password to continue.")
-
-
