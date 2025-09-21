@@ -329,9 +329,9 @@ with tab_vote:
             st.stop()
 
         positions = cands["position"].unique().tolist()
-        pos = st.selectbox("পদের নাম বাছাই করুন", positions, index=0)
+        pos = st.radio("পদের নাম বাছাই করুন", positions, index=0)
         opts = cands[cands["position"] == pos]["candidate"].tolist()
-        cand = st.selectbox("প্রার্থীর নাম বাছাই করুন", opts, index=0)
+        cand = st.radio("প্রার্থীর নাম বাছাই করুন", opts, index=0)
 
         if st.button("✅ Submit Vote"):
             append_vote(pos, cand)
