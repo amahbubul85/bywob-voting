@@ -24,6 +24,9 @@ votes_ws = sheet.worksheet("votes")
 
 PLACEHOLDER = "— একজন প্রার্থী নির্বাচন করুন —"
 
+# ---------------------------
+# Loaders
+# ---------------------------
 @st.cache_data
 def load_voters():
     df = pd.DataFrame(voters_ws.get_all_records())
@@ -35,9 +38,16 @@ def load_voters():
 def load_candidates():
     df = pd.DataFrame(candidates_ws.get_all_records())
     if df.empty:
-        df = pd.DataFrame(columns=["position","candidate"])
+        return pd.DataFrame(columns=["position","candidate"])
+    # স্পেস ট্রিম + ফাঁকা রো বাদ
+    df["position"]  = df["position"].astype(str).str.strip()
+    df["candidate"] = df["candidate"].astype(str).str.strip()
+    df = df[(df["position"] != "") & (df["candidate"] != "")]
     return df
 
+# ---------------------------
+# Token helpers
+# ---------------------------
 def _boolish(x):
     return str(x).strip().lower() in ["true","1","yes"]
 
@@ -61,6 +71,9 @@ def mark_token_used(token):
     voters_ws.update_cell(row_index, used_at_col, datetime.utcnow().isoformat())
     load_voters.clear()
 
+# ---------------------------
+# Voting helpers
+# ---------------------------
 def save_vote_batch(selections, positions):
     now = datetime.utcnow().isoformat()
     rows = [[pos, selections[pos], now] for pos in positions]
@@ -76,10 +89,8 @@ def ballot_form(cands, positions):
             choice = st.radio(f"**{pos}**", options, index=0, key=f"radio_{pos}")
             selections[pos] = None if choice == PLACEHOLDER else choice
 
+        submitted = st.form_submit_button("✅ ভোট জমা দিন")
         missing = [p for p in positions if selections[p] is None]
-        can_submit = (len(missing) == 0)
-
-        submitted = st.form_submit_button("✅ ভোট জমা দিন", disabled=not can_submit)
         return submitted, selections, missing
 
 def tally(cands):
@@ -93,6 +104,9 @@ def tally(cands):
         counts = votes[votes["position"] == pos]["candidate"].value_counts()
         st.table(counts.rename("votes"))
 
+# ---------------------------
+# Token generator
+# ---------------------------
 def generate_token(prefix="BYWOB-2025", n=8):
     alphabet = string.ascii_uppercase + string.digits
     return f"{prefix}-" + "".join(secrets.choice(alphabet) for _ in range(n))
@@ -106,10 +120,12 @@ def add_tokens(count, prefix="BYWOB-2025"):
         voters_ws.append_rows(rows, value_input_option="RAW")
         load_voters.clear()
 
-# ---- Main UI ----
+# ---------------------------
+# Main UI
+# ---------------------------
 voters = load_voters()
 cands  = load_candidates()
-positions = cands["position"].unique().tolist()
+positions = sorted(pd.unique(cands["position"]))
 
 tab_vote, tab_admin = st.tabs(["🔐 Vote", "🛠️ Admin"])
 
@@ -126,9 +142,9 @@ with tab_vote:
                 if len(missing) == 0:
                     mark_token_used(token.strip())
                     save_vote_batch(selections, positions)
-                    st.success("আপনার ভোট সংরক্ষিত হয়েছে ✅")
+                    st.success("✅ আপনার ভোট গোপনে Google Sheets-এ সংরক্ষিত হয়েছে। ধন্যবাদ!")
                 else:
-                    st.error("প্রতিটি পদের জন্য একজন প্রার্থী নির্বাচন করুন।")
+                    st.error("❗ এই পজিশনগুলোতে নির্বাচন বাকি আছে: " + ", ".join(missing))
 
 with tab_admin:
     st.caption("Admin ট্যাব (ADMIN_PASSWORD Secrets এ দিলে পাসওয়ার্ড লাগবে)")
