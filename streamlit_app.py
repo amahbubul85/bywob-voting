@@ -1,28 +1,32 @@
-# BYWOB Online Voting — Streamlit + Google Sheets
+# BYWOB Online Voting — Streamlit + Google Sheets (CET/CEST edition)
 # Features:
 # - One-screen voting (all positions together)
 # - Google Sheets backend (meta, voters, candidates, votes)
-# - Election window (UTC): idle | ongoing | ended | published
-# - Start/End Now buttons update schedule fields & UI instantly
-# - Archive previous votes & reset tokens for new election
+# - Server-wide cache to avoid Google Sheets 429 rate limits
+# - Election window (CET/CEST Paris): idle | ongoing | ended | published
+# - Start/End Now buttons update schedule + UI instantly
+# - Archive previous votes & reset tokens for a fresh round
 # - Token generator
-# - Live tally with quota-friendly caching + optional auto-refresh
+# - Live tally with optional auto-refresh (quota-friendly)
 
 import streamlit as st
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+ — handles DST properly
 
+# --------- App & Timezone ---------
+LOCAL_TZ = ZoneInfo("Europe/Paris")  # CET/CEST (Paris), daylight saving aware
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
-st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time tokens")
+st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time tokens • Timezone: CET/CEST (Europe/Paris)")
 
-# ====== Quota-friendly refresh config (tune as needed) ======
-LIVE_REFRESH_SEC = 15           # Results auto-refresh interval when enabled
-TTL_VOTERS_SEC   = 120          # Cache lifetime for voters sheet
-TTL_CANDS_SEC    = 120          # Cache lifetime for candidates sheet
-TTL_VOTES_SEC    = LIVE_REFRESH_SEC  # Cache lifetime for votes sheet
+# ====== Quota-friendly refresh config (server-wide cache) ======
+LIVE_REFRESH_SEC = 30            # Results auto-refresh interval (when toggled ON)
+TTL_VOTERS_SEC   = 300           # voters read at most once per 5 min (server-wide)
+TTL_CANDS_SEC    = 300           # candidates read at most once per 5 min
+TTL_VOTES_SEC    = 15            # votes read at most once per 15 sec
 
 # --------------------------- Secrets & Auth ---------------------------
 def _require_secrets():
@@ -58,7 +62,8 @@ candidates_ws = ensure_ws("candidates", ["position", "candidate"], rows=500, col
 votes_ws      = ensure_ws("votes", ["position", "candidate", "timestamp"], rows=5000, cols=3)
 
 # --------------------------- Meta helpers ---------------------------
-def now_utc(): return datetime.now(timezone.utc)
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
 
 def meta_get_all() -> dict:
     recs = meta_ws.get_all_records()
@@ -75,17 +80,25 @@ def meta_set(key: str, value: str):
 _m = meta_get_all()
 if "status" not in _m:     meta_set("status", "idle")
 if "name" not in _m:       meta_set("name", "")
-if "start_utc" not in _m:  meta_set("start_utc", "")
-if "end_utc" not in _m:    meta_set("end_utc", "")
+if "start_utc" in _m and "start_cet" not in _m:  # backward compat: migrate keys if app was UTC before
+    meta_set("start_cet", _m.get("start_utc"))
+    meta_set("end_cet", _m.get("end_utc", ""))
+if "start_cet" not in _m:  meta_set("start_cet", "")
+if "end_cet" not in _m:    meta_set("end_cet", "")
 if "published" not in _m:  meta_set("published", "FALSE")
 
-def parse_iso_or_none(s: str | None):
+def parse_iso_local_or_none(s: str | None):
+    """
+    Parse ISO string to aware datetime.
+    - If string has tzinfo, keep it and convert to LOCAL_TZ.
+    - If naive, assume LOCAL_TZ.
+    """
     if not s: return None
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ)
     except Exception:
         return None
 
@@ -93,48 +106,98 @@ def is_voting_open() -> bool:
     m = meta_get_all()
     if m.get("status", "idle") != "ongoing":
         return False
-    start_dt = parse_iso_or_none(m.get("start_utc"))
-    end_dt   = parse_iso_or_none(m.get("end_utc"))
-    now = now_utc()
+    start_dt = parse_iso_local_or_none(m.get("start_cet"))
+    end_dt   = parse_iso_local_or_none(m.get("end_cet"))
+    now = now_local()
     if start_dt and now < start_dt: return False
     if end_dt and now > end_dt:
         meta_set("status", "ended")
         return False
     return True
 
-# --------------------------- Cached data loaders ---------------------------
-@st.cache_data(show_spinner=False, ttl=TTL_VOTERS_SEC)
+# --------------------------- Server-wide sheet cache ---------------------------
+@st.cache_resource
+def get_sheet_cache():
+    from dataclasses import dataclass
+    from time import time
+
+    @dataclass
+    class _Item:
+        df: pd.DataFrame | None
+        ts: float
+
+    class SheetCache:
+        def __init__(self, sheet_obj):
+            self.sheet = sheet_obj
+            self._voters  = _Item(None, 0.0)
+            self._cands   = _Item(None, 0.0)
+            self._votes   = _Item(None, 0.0)
+
+        def _expired(self, last_ts: float, ttl: int) -> bool:
+            return (time() - last_ts) > ttl
+
+        def voters_df(self) -> pd.DataFrame:
+            import pandas as _pd
+            if self._voters.df is None or self._expired(self._voters.ts, TTL_VOTERS_SEC):
+                ws = self.sheet.worksheet("voters")
+                df = _pd.DataFrame(ws.get_all_records())
+                if df.empty:
+                    df = _pd.DataFrame(columns=["name","email","token","used","used_at"])
+                for c in ["name","email","token","used","used_at"]:
+                    if c not in df.columns: df[c] = ""
+                df["token"] = df["token"].astype(str).str.strip()
+                df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
+                self._voters = _Item(df, time())
+            return self._voters.df
+
+        def candidates_df(self) -> pd.DataFrame:
+            import pandas as _pd
+            if self._cands.df is None or self._expired(self._cands.ts, TTL_CANDS_SEC):
+                ws = self.sheet.worksheet("candidates")
+                df = _pd.DataFrame(ws.get_all_records())
+                if df.empty:
+                    df = _pd.DataFrame(columns=["position","candidate"])
+                for c in ["position","candidate"]:
+                    if c not in df.columns: df[c] = ""
+                df["position"]  = df["position"].astype(str).str.strip()
+                df["candidate"] = df["candidate"].astype(str).str.strip()
+                df = df[(df["position"]!="") & (df["candidate"]!="")]
+                self._cands = _Item(df[["position","candidate"]], time())
+            return self._cands.df
+
+        def votes_df(self) -> pd.DataFrame:
+            import pandas as _pd
+            if self._votes.df is None or self._expired(self._votes.ts, TTL_VOTES_SEC):
+                ws = self.sheet.worksheet("votes")
+                df = _pd.DataFrame(ws.get_all_records())
+                if df.empty:
+                    df = _pd.DataFrame(columns=["position","candidate","timestamp"])
+                self._votes = _Item(df[["position","candidate","timestamp"]], time())
+            return self._votes.df
+
+        # Invalidate on writes
+        def invalidate_voters(self): self._voters.ts = 0.0
+        def invalidate_cands(self):  self._cands.ts  = 0.0
+        def invalidate_votes(self):  self._votes.ts  = 0.0
+
+    return SheetCache(sheet)
+
+SHEET_CACHE = get_sheet_cache()
+
+# --------------------------- Cached data loaders (use server cache) ----------------
 def load_voters_df():
-    df = pd.DataFrame(voters_ws.get_all_records())
-    if df.empty:
-        df = pd.DataFrame(columns=["name","email","token","used","used_at"])
-    for c in ["name","email","token","used","used_at"]:
-        if c not in df.columns: df[c] = ""
-    df["token"] = df["token"].astype(str).str.strip()
-    df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
-    return df[["name","email","token","used","used_at","used_bool"]]
+    return SHEET_CACHE.voters_df()
 
-@st.cache_data(show_spinner=False, ttl=TTL_CANDS_SEC)
 def load_candidates_df():
-    df = pd.DataFrame(candidates_ws.get_all_records())
-    if df.empty:
-        df = pd.DataFrame(columns=["position","candidate"])
-    for c in ["position","candidate"]:
-        if c not in df.columns: df[c] = ""
-    df["position"]  = df["position"].astype(str).str.strip()
-    df["candidate"] = df["candidate"].astype(str).str.strip()
-    df = df[(df["position"]!="") & (df["candidate"]!="")]
-    return df[["position","candidate"]]
+    return SHEET_CACHE.candidates_df()
 
-@st.cache_data(show_spinner=False, ttl=TTL_VOTES_SEC)
 def load_votes_df():
-    df = pd.DataFrame(votes_ws.get_all_records())
-    if df.empty:
-        df = pd.DataFrame(columns=["position","candidate","timestamp"])
-    return df[["position","candidate","timestamp"]]
+    return SHEET_CACHE.votes_df()
 
 def clear_caches():
-    load_voters_df.clear(); load_candidates_df.clear(); load_votes_df.clear()
+    SHEET_CACHE.invalidate_voters()
+    SHEET_CACHE.invalidate_cands()
+    SHEET_CACHE.invalidate_votes()
 
 # --------------------------- Sheet write helpers ---------------------------
 def mark_token_used(voters_df: pd.DataFrame, token: str):
@@ -143,13 +206,13 @@ def mark_token_used(voters_df: pd.DataFrame, token: str):
     if m.empty: return
     row_idx = m.index[0] + 2
     voters_ws.update_cell(row_idx, 4, "TRUE")
-    voters_ws.update_cell(row_idx, 5, now_utc().isoformat())
-    load_voters_df.clear()
+    voters_ws.update_cell(row_idx, 5, now_local().isoformat())  # CET timestamp
+    SHEET_CACHE.invalidate_voters()
 
 def append_vote_rows(rows: list[list[str]]):
     if rows:
         votes_ws.append_rows(rows, value_input_option="RAW")
-        load_votes_df.clear()
+        SHEET_CACHE.invalidate_votes()
 
 def generate_tokens(n: int, prefix: str):
     import secrets, string
@@ -160,12 +223,12 @@ def generate_tokens(n: int, prefix: str):
         rows.append(["","",tok,"FALSE",""])
     if rows:
         voters_ws.append_rows(rows, value_input_option="RAW")
-        load_voters_df.clear()
+        SHEET_CACHE.invalidate_voters()
 
 def archive_votes(election_name: str | None):
     rows = votes_ws.get_all_records()
     if not rows: return None
-    ts = now_utc().strftime("%Y%m%dT%H%M%SZ")
+    ts = now_local().strftime("%Y%m%dT%H%M%S%z")  # CET time stamp
     safe = (election_name or "election").replace(" ", "_")[:20]
     title = f"votes_archive_{safe}_{ts}"
     new_ws = sheet.add_worksheet(title=title, rows=len(rows)+5, cols=3)
@@ -176,7 +239,7 @@ def archive_votes(election_name: str | None):
 def clear_votes_sheet():
     votes_ws.clear()
     votes_ws.append_row(["position","candidate","timestamp"], value_input_option="RAW")
-    load_votes_df.clear()
+    SHEET_CACHE.invalidate_votes()
 
 def reset_all_tokens():
     df = load_voters_df()
@@ -185,7 +248,7 @@ def reset_all_tokens():
         row_idx = i + 2
         voters_ws.update_cell(row_idx, 4, "FALSE")
         voters_ws.update_cell(row_idx, 5, "")
-    load_voters_df.clear()
+    SHEET_CACHE.invalidate_voters()
     return len(df)
 
 def results_df():
@@ -212,8 +275,8 @@ with tab_vote:
             st.error(
                 "এখন ভোট গ্রহণ করা হচ্ছে না।\n\n"
                 f"Status: {m.get('status','idle')}\n"
-                f"Start (UTC): {m.get('start_utc','')}\n"
-                f"End (UTC): {m.get('end_utc','')}"
+                f"Start (CET): {m.get('start_cet','')}\n"
+                f"End (CET): {m.get('end_cet','')}"
             ); st.stop()
 
         voters = load_voters_df()
@@ -237,7 +300,7 @@ with tab_vote:
 
         if submitted:
             rows = []
-            ts = now_utc().isoformat()
+            ts = now_local().isoformat()  # CET timestamp
             for p, cand in selections.items():
                 if cand and cand.strip():
                     rows.append([p, cand, ts])
@@ -286,19 +349,19 @@ with tab_admin:
         st.warning("Please enter admin password to continue.")
     else:
         m = meta_get_all()
-        start_dt_meta = parse_iso_or_none(m.get("start_utc"))
-        end_dt_meta   = parse_iso_or_none(m.get("end_utc"))
-        now_ = now_utc()
+        start_dt_meta = parse_iso_local_or_none(m.get("start_cet"))
+        end_dt_meta   = parse_iso_local_or_none(m.get("end_cet"))
+        now_ = now_local()
 
         st.markdown("### 🗓️ Election control")
         st.markdown(f"- **Current election name:** `{m.get('name','(none)')}`")
         st.markdown(f"- **Status:** `{m.get('status','idle')}`")
-        st.markdown(f"- **Start (UTC):** `{m.get('start_utc','')}`")
-        st.markdown(f"- **End (UTC):** `{m.get('end_utc','')}`")
+        st.markdown(f"- **Start (CET):** `{m.get('start_cet','')}`")
+        st.markdown(f"- **End (CET):** `{m.get('end_cet','')}`")
         st.markdown(f"- **Published:** `{m.get('published','FALSE')}`")
 
         st.divider()
-        st.markdown("#### Create / Schedule new election")
+        st.markdown("#### Create / Schedule new election (CET/CEST)")
 
         c1, c2 = st.columns(2)
         # Prefill from meta if available, otherwise now
@@ -307,23 +370,23 @@ with tab_admin:
         start_time_default = (start_dt_meta or now_).time().replace(microsecond=0)
         end_time_default   = (end_dt_meta   or now_).time().replace(microsecond=0)
 
-        start_date = c1.date_input("Start date (UTC)", value=start_date_default)
-        end_date   = c2.date_input("End date (UTC)",   value=end_date_default)
+        start_date = c1.date_input("Start date (CET)", value=start_date_default)
+        end_date   = c2.date_input("End date (CET)",   value=end_date_default)
 
         mode = st.radio("Time input mode",
                         ["Picker (recommended)", "Manual (type HH:MM or HH:MM:SS)"],
                         horizontal=True)
 
         if mode == "Picker (recommended)":
-            start_time = c1.time_input("Start time (UTC)", value=start_time_default,
+            start_time = c1.time_input("Start time (CET)", value=start_time_default,
                                        step=timedelta(minutes=1))  # Streamlit requires >= 60s
-            end_time   = c2.time_input("End time (UTC)",   value=end_time_default,
+            end_time   = c2.time_input("End time (CET)",   value=end_time_default,
                                        step=timedelta(minutes=1))
         else:
             st.caption("Tip: 24h format, যেমন 09:05 বা 09:05:30")
             cc1, cc2 = st.columns(2)
-            s_str = cc1.text_input("Start time (UTC) — manual", value=start_time_default.strftime("%H:%M:%S"))
-            e_str = cc2.text_input("End time (UTC) — manual",   value=end_time_default.strftime("%H:%M:%S"))
+            s_str = cc1.text_input("Start time (CET) — manual", value=start_time_default.strftime("%H:%M:%S"))
+            e_str = cc2.text_input("End time (CET) — manual",   value=end_time_default.strftime("%H:%M:%S"))
             def _p(s):
                 for fmt in ("%H:%M:%S", "%H:%M"):
                     try: return datetime.strptime(s.strip(), fmt).time()
@@ -334,31 +397,32 @@ with tab_admin:
             except ValueError as e:
                 st.error(str(e)); st.stop()
 
-        start_dt = datetime.combine(start_date, start_time).replace(tzinfo=timezone.utc)
-        end_dt   = datetime.combine(end_date,   end_time).replace(tzinfo=timezone.utc)
+        # combine to aware CET datetimes
+        start_dt = datetime.combine(start_date, start_time).replace(tzinfo=LOCAL_TZ)
+        end_dt   = datetime.combine(end_date,   end_time).replace(tzinfo=LOCAL_TZ)
 
         ename = st.text_input("Election name", value=m.get("name",""))
 
         if st.button("Set & Schedule"):
             meta_set("name", ename)
-            meta_set("start_utc", start_dt.isoformat())
-            meta_set("end_utc", end_dt.isoformat())
+            meta_set("start_cet", start_dt.isoformat())
+            meta_set("end_cet", end_dt.isoformat())
             meta_set("status", "idle")
             meta_set("published", "FALSE")
-            st.success(f"Election scheduled.\nStart: {start_dt.isoformat()}\nEnd: {end_dt.isoformat()}")
+            st.success(f"Election scheduled (CET).\nStart: {start_dt.isoformat()}\nEnd: {end_dt.isoformat()}")
             st.rerun()  # reflect new times immediately
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
             meta_set("status", "ongoing")
-            meta_set("start_utc", now_.isoformat())
-            st.success("Election started. Start time set to now (UTC).")
+            meta_set("start_cet", now_.isoformat())
+            st.success("Election started. Start time set to now (CET).")
             st.rerun()
 
         if c4.button("End Election Now"):
             meta_set("status", "ended")
-            meta_set("end_utc", now_.isoformat())
-            st.success("Election ended. End time set to now (UTC).")
+            meta_set("end_cet", now_.isoformat())
+            st.success("Election ended. End time set to now (CET).")
             st.rerun()
 
         if c5.button("Publish Results (declare)"):
