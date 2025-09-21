@@ -2,7 +2,7 @@
 # BYWOB Online Voting — Streamlit + Google Sheets
 # - Auto-creates required worksheets with headers (meta, voters, candidates, votes)
 # - One-time token voting
-# - Election window (start/end in UTC): idle | ongoing | ended | published
+# - Election window (start/end in CET): idle | ongoing | ended | published
 # - Block votes outside window, publish/declare results
 # - Token generator (no hard max)
 # - Live tally, CSV export
@@ -12,13 +12,26 @@ import streamlit as st
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 from functools import wraps
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time tokens")
+
+# --------------------------------------------------------------------------------------
+# CET Timezone Setup
+# --------------------------------------------------------------------------------------
+CET = timezone(timedelta(hours=1))  # CET is UTC+1
+
+def now_cet():
+    return datetime.now(CET)
+
+def to_cet(dt):
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=CET)
+    return dt.astimezone(CET)
 
 # --------------------------------------------------------------------------------------
 # API Rate Limiting Decorator
@@ -110,9 +123,6 @@ votes_ws       = ensure_ws("votes", ["position", "candidate", "timestamp"], rows
 # --------------------------------------------------------------------------------------
 # Meta helpers (status & schedule)
 # --------------------------------------------------------------------------------------
-def now_utc():
-    return datetime.now(timezone.utc)
-
 def meta_get_all() -> dict:
     def get_records():
         return meta_ws.get_all_records()
@@ -139,8 +149,8 @@ def meta_set(key: str, value: str):
 _meta = meta_get_all()
 if "status" not in _meta:     meta_set("status", "idle")         # idle | ongoing | ended | published
 if "name" not in _meta:       meta_set("name", "")
-if "start_utc" not in _meta:  meta_set("start_utc", "")
-if "end_utc" not in _meta:    meta_set("end_utc", "")
+if "start_cet" not in _meta:  meta_set("start_cet", "")
+if "end_cet" not in _meta:    meta_set("end_cet", "")
 if "published" not in _meta:  meta_set("published", "FALSE")
 
 def is_voting_open() -> bool:
@@ -148,16 +158,16 @@ def is_voting_open() -> bool:
     if m.get("status", "idle") != "ongoing":
         return False
     try:
-        start = m.get("start_utc", "")
-        end   = m.get("end_utc", "")
+        start = m.get("start_cet", "")
+        end   = m.get("end_cet", "")
         start_dt = datetime.fromisoformat(start) if start else None
         end_dt   = datetime.fromisoformat(end) if end else None
     except Exception:
         return False
-    now = now_utc()
-    if start_dt and now < start_dt.astimezone(timezone.utc):
+    now = now_cet()
+    if start_dt and now < to_cet(start_dt):
         return False
-    if end_dt and now > end_dt.astimezone(timezone.utc):
+    if end_dt and now > to_cet(end_dt):
         meta_set("status", "ended")  # auto-close
         return False
     return True
@@ -189,7 +199,7 @@ def load_candidates_df():
         df = pd.DataFrame(columns=["position", "candidate"])
     for col in ["position", "candidate"]:
         if col not in df.columns: df[col] = ""
-    df["position"] = df["position"].astype(str).str.strip()  # Fixed syntax error here
+    df["position"] = df["position"].astype(str).str.strip()
     df["candidate"] = df["candidate"].astype(str).str.strip()
     df = df[(df["position"] != "") & (df["candidate"] != "")]
     return df[["position", "candidate"]]
@@ -217,14 +227,14 @@ def mark_token_used(voters_df: pd.DataFrame, token: str):
     
     def update_operation():
         voters_ws.update_cell(row_idx, 4, "TRUE")                    # used
-        voters_ws.update_cell(row_idx, 5, now_utc().isoformat())     # used_at
+        voters_ws.update_cell(row_idx, 5, now_cet().isoformat())     # used_at
     
     safe_sheet_operation(update_operation)
     load_voters_df.clear()
 
 def append_vote(position: str, candidate: str):
     def append_operation():
-        votes_ws.append_row([position, candidate, now_utc().isoformat()], value_input_option="RAW")
+        votes_ws.append_row([position, candidate, now_cet().isoformat()], value_input_option="RAW")
     
     safe_sheet_operation(append_operation)
     load_votes_df.clear()
@@ -250,7 +260,7 @@ def archive_and_clear_votes(election_name: str | None):
     rows = safe_sheet_operation(get_records)
     if not rows:
         return "no_votes"
-    ts = now_utc().strftime("%Y%m%dT%H%M%SZ")
+    ts = now_cet().strftime("%Y%m%dT%H%M%S")
     safe = (election_name or "election").replace(" ", "_")[:20]
     title = f"votes_archive_{safe}_{ts}"
     
@@ -299,8 +309,8 @@ with tab_vote:
             st.error(
                 "এখন ভোট গ্রহণ করা হচ্ছে না।\n\n"
                 f"Status: {m.get('status','idle')}\n"
-                f"Start (UTC): {m.get('start_utc','')}\n"
-                f"End (UTC): {m.get('end_utc','')}"
+                f"Start (CET): {m.get('start_cet','')}\n"
+                f"End (CET): {m.get('end_cet','')}"
             )
             st.stop()
 
@@ -315,7 +325,7 @@ with tab_vote:
 
         cands = load_candidates_df()
         if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ट্যাব থেকে প্রার্থী যোগ করুন।")
+            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।")
             st.stop()
 
         positions = cands["position"].unique().tolist()
@@ -355,42 +365,38 @@ with tab_admin:
         st.markdown("### 🗓️ Election control")
         st.markdown(f"- **Current election name:** `{m.get('name','(none)')}`")
         st.markdown(f"- **Status:** `{m.get('status','idle')}`")
-        st.markdown(f"- **Start (UTC):** `{m.get('start_utc','')}`")
-        st.markdown(f"- **End (UTC):** `{m.get('end_utc','')}`")
+        st.markdown(f"- **Start (CET):** `{m.get('start_cet','')}`")
+        st.markdown(f"- **End (CET):** `{m.get('end_cet','')}`")
         st.markdown(f"- **Published:** `{m.get('published','FALSE')}`")
 
         st.divider()
         st.markdown("#### Create / Schedule new election")
 
-        # সরলীকৃত সময় নির্বাচন - শুধুমাত্র লোকাল তারিখ এবং সময়
+        # সরলীকৃত সময় নির্বাচন - শুধুমাত্র CET তারিখ এবং সময়
         ename = st.text_input("Election name", value=m.get("name",""))
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**Start Time**")
-            start_date = st.date_input("Start date", value=datetime.now().date(), key="start_date")
-            start_time = st.time_input("Start time", value=datetime.now().time().replace(second=0, microsecond=0), key="start_time")
+            st.markdown("**Start Time (CET)**")
+            start_date = st.date_input("Start date", value=datetime.now(CET).date(), key="start_date")
+            start_time = st.time_input("Start time", value=datetime.now(CET).time().replace(second=0, microsecond=0), key="start_time")
         
         with col2:
-            st.markdown("**End Time**")
-            end_date = st.date_input("End date", value=datetime.now().date(), key="end_date")
-            end_time = st.time_input("End time", value=(datetime.now().time().replace(second=0, microsecond=0)), key="end_time")
+            st.markdown("**End Time (CET)**")
+            end_date = st.date_input("End date", value=datetime.now(CET).date(), key="end_date")
+            end_time = st.time_input("End time", value=(datetime.now(CET).time().replace(second=0, microsecond=0)), key="end_time")
         
-        # লোকাল তারিখ এবং সময়কে UTC-তে রূপান্তর
-        start_dt_local = datetime.combine(start_date, start_time)
-        end_dt_local = datetime.combine(end_date, end_time)
+        # CET তারিখ এবং সময়
+        start_dt_cet = datetime.combine(start_date, start_time).replace(tzinfo=CET)
+        end_dt_cet = datetime.combine(end_date, end_time).replace(tzinfo=CET)
         
-        # UTC-তে রূপান্তর
-        start_dt_utc = start_dt_local.astimezone(timezone.utc)
-        end_dt_utc = end_dt_local.astimezone(timezone.utc)
-        
-        st.info(f"**সময়সূচী:**\n- শুরু: {start_dt_local.strftime('%Y-%m-%d %H:%M')} (লোকাল)\n- শেষ: {end_dt_local.strftime('%Y-%m-%d %H:%M')} (লোকাল)")
+        st.info(f"**সময়সূচী (CET):**\n- শুরু: {start_dt_cet.strftime('%Y-%m-%d %H:%M')}\n- শেষ: {end_dt_cet.strftime('%Y-%m-%d %H:%M')}")
 
         if st.button("Set & Schedule"):
             meta_set("name", ename)
-            meta_set("start_utc", start_dt_utc.isoformat())
-            meta_set("end_utc", end_dt_utc.isoformat())
+            meta_set("start_cet", start_dt_cet.isoformat())
+            meta_set("end_cet", end_dt_cet.isoformat())
             meta_set("status", "idle")
             meta_set("published", "FALSE")
             st.success("Election scheduled successfully!")
@@ -398,14 +404,14 @@ with tab_admin:
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
-            # বর্তমান সময় থেকে শুরু এবং 24 ঘন্টা পরে শেষ
-            start_now = datetime.now(timezone.utc)
-            end_now = start_now.replace(hour=23, minute=59, second=0)  # আজ রাত 11:59 পর্যন্ত
+            # বর্তমান CET সময় থেকে শুরু এবং আজ মধ্যরাত পর্যন্ত
+            start_now = datetime.now(CET)
+            end_now = start_now.replace(hour=23, minute=59, second=0)  # আজ রাত 11:59 CET পর্যন্ত
             
-            meta_set("start_utc", start_now.isoformat())
-            meta_set("end_utc", end_now.isoformat())
+            meta_set("start_cet", start_now.isoformat())
+            meta_set("end_cet", end_now.isoformat())
             meta_set("status", "ongoing")
-            st.success("Election started now! Will end at midnight.")
+            st.success("Election started now! Will end at midnight CET.")
             st.rerun()
 
         if c4.button("End Election Now"):
