@@ -1,10 +1,12 @@
 # BYWOB Online Voting — Streamlit + Google Sheets
+# Features:
 # - One-screen voting (all positions together)
-# - Auto-create worksheets (meta, voters, candidates, votes)
+# - Google Sheets backend (meta, voters, candidates, votes)
 # - Election window (UTC): idle | ongoing | ended | published
-# - Start/End now buttons update schedule fields and UI immediately
-# - Archive old votes & reset tokens for new round
-# - Token generator, live tally (ttl), CSV export, manual refresh
+# - Start/End Now buttons update schedule fields & UI instantly
+# - Archive previous votes & reset tokens for new election
+# - Token generator
+# - Live tally with quota-friendly caching + optional auto-refresh
 
 import streamlit as st
 import pandas as pd
@@ -15,6 +17,12 @@ from datetime import datetime, timezone, timedelta
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + Google Sheets • Secret ballot with one-time tokens")
+
+# ====== Quota-friendly refresh config (tune as needed) ======
+LIVE_REFRESH_SEC = 15           # Results auto-refresh interval when enabled
+TTL_VOTERS_SEC   = 120          # Cache lifetime for voters sheet
+TTL_CANDS_SEC    = 120          # Cache lifetime for candidates sheet
+TTL_VOTES_SEC    = LIVE_REFRESH_SEC  # Cache lifetime for votes sheet
 
 # --------------------------- Secrets & Auth ---------------------------
 def _require_secrets():
@@ -95,7 +103,7 @@ def is_voting_open() -> bool:
     return True
 
 # --------------------------- Cached data loaders ---------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=TTL_VOTERS_SEC)
 def load_voters_df():
     df = pd.DataFrame(voters_ws.get_all_records())
     if df.empty:
@@ -106,7 +114,7 @@ def load_voters_df():
     df["used_bool"] = df["used"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
     return df[["name","email","token","used","used_at","used_bool"]]
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=TTL_CANDS_SEC)
 def load_candidates_df():
     df = pd.DataFrame(candidates_ws.get_all_records())
     if df.empty:
@@ -118,7 +126,7 @@ def load_candidates_df():
     df = df[(df["position"]!="") & (df["candidate"]!="")]
     return df[["position","candidate"]]
 
-@st.cache_data(show_spinner=False, ttl=5)  # ← Live-ish refresh
+@st.cache_data(show_spinner=False, ttl=TTL_VOTES_SEC)
 def load_votes_df():
     df = pd.DataFrame(votes_ws.get_all_records())
     if df.empty:
@@ -128,7 +136,7 @@ def load_votes_df():
 def clear_caches():
     load_voters_df.clear(); load_candidates_df.clear(); load_votes_df.clear()
 
-# --------------------------- Sheet operations ---------------------------
+# --------------------------- Sheet write helpers ---------------------------
 def mark_token_used(voters_df: pd.DataFrame, token: str):
     t = str(token).strip()
     m = voters_df[voters_df["token"] == t]
@@ -173,7 +181,6 @@ def clear_votes_sheet():
 def reset_all_tokens():
     df = load_voters_df()
     if df.empty: return 0
-    # Overwrite used = FALSE, used_at = ""
     for i in range(len(df)):
         row_idx = i + 2
         voters_ws.update_cell(row_idx, 4, "FALSE")
@@ -242,13 +249,18 @@ with tab_vote:
             mark_token_used(voters, token)
             st.success("আপনার সব ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
 
-# --------------------------- Results ---------------------------
+# --------------------------- Results (quota-friendly) ---------------------------
 with tab_results:
     st.subheader("📊 Live Results")
 
-    # Manual refresh
-    rcol1, rcol2 = st.columns([1,3])
-    if rcol1.button("🔄 Refresh now"):
+    # Auto refresh টগল (ডিফল্ট OFF, যাতে কোটা কম খায়)
+    auto = st.toggle(f"Auto refresh every {LIVE_REFRESH_SEC}s", value=False)
+    if auto:
+        st.autorefresh(interval=LIVE_REFRESH_SEC * 1000, key="auto_refresh_key")
+
+    # ম্যানুয়াল রিফ্রেশ বোতাম (cache clear + rerun)
+    colR1, colR2 = st.columns([1,3])
+    if colR1.button("🔄 Refresh now"):
         clear_caches()
         st.rerun()
 
@@ -338,14 +350,12 @@ with tab_admin:
 
         c3, c4, c5 = st.columns(3)
         if c3.button("Start Election Now"):
-            # set status ongoing and bump start_utc to now
             meta_set("status", "ongoing")
             meta_set("start_utc", now_.isoformat())
             st.success("Election started. Start time set to now (UTC).")
-            st.rerun()  # update inputs & status immediately
+            st.rerun()
 
         if c4.button("End Election Now"):
-            # set status ended and bump end_utc to now
             meta_set("status", "ended")
             meta_set("end_utc", now_.isoformat())
             st.success("Election ended. End time set to now (UTC).")
