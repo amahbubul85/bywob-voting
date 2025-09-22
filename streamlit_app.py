@@ -239,63 +239,109 @@ tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "�
 
 # ------------------------ Vote Tab ------------------------
 with tab_vote:
-    if is_voting_open():
+    # keep ballot state in session
+    if "ballot" not in st.session_state:
+        st.session_state.ballot = {"ready": False}
+
+    # only auto-refresh when *not* in the ballot
+    if is_voting_open() and not st.session_state.ballot["ready"]:
         st.markdown('<meta http-equiv="refresh" content="30">', unsafe_allow_html=True)
 
     st.subheader("ভোট দিন (টোকেন ব্যবহার করে)")
-    token = st.text_input("আপনার টোকেন লিখুন", placeholder="BYWOB-2025-XXXXXX")
 
-    if st.button("Proceed"):
-        if not token:
-            st.error("টোকেন দিন।"); st.stop()
+    # ---------- Stage 1: ask for token ----------
+    if not st.session_state.ballot["ready"]:
+        token = st.text_input("আপনার টোকেন লিখুন", placeholder="BYWOB-2025-XXXXXX")
+        if st.button("Proceed"):
+            if not token:
+                st.error("টোকেন দিন।")
+                st.stop()
 
-        if not is_voting_open():
-            m = meta_get_all()
-            st.error(
-                "এখন ভোট গ্রহণ করা হচ্ছে না।\n\n"
-                f"Status: {m.get('status','idle')}\n"
-                f"Start (CET): {m.get('start_cet','')}\n"
-                f"End (CET): {m.get('end_cet','')}"
-            )
-            st.stop()
+            if not is_voting_open():
+                m = meta_get_all()
+                st.error(
+                    "এখন ভোট গ্রহণ করা হচ্ছে না।\n\n"
+                    f"Status: {m.get('status','idle')}\n"
+                    f"Start (CET): {m.get('start_cet','')}\n"
+                    f"End (CET): {m.get('end_cet','')}"
+                )
+                st.stop()
 
-        voters = load_voters_df()
-        row = voters[voters["token"] == token.strip()]
-        if row.empty:
-            st.error("❌ টোকেন সঠিক নয়।"); st.stop()
-        if row["used_bool"].iloc[0]:
-            st.error("⚠️ এই টোকেনটি ইতিমধ্যে ব্যবহার করা হয়েছে।"); st.stop()
+            voters = load_voters_df()
+            row = voters[voters["token"] == token.strip()]
+            if row.empty:
+                st.error("❌ টোকেন সঠিক নয়।")
+                st.stop()
+            if row["used_bool"].iloc[0]:
+                st.error("⚠️ এই টোকেনটি ইতিমধ্যে ব্যবহার করা হয়েছে।")
+                st.stop()
 
-        cands = load_candidates_df()
-        if cands.empty:
-            st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।"); st.stop()
+            # snapshot candidates from cache so we don't re-read on every rerun
+            cands = load_candidates_df()
+            if cands.empty:
+                st.warning("candidates শিট ফাঁকা। Admin ট্যাব থেকে প্রার্থী যোগ করুন।")
+                st.stop()
 
-        st.markdown("### সকল পদ এবং প্রার্থী")
-        if "votes" not in st.session_state:
-            st.session_state.votes = {}
+            pos_to_cands = {
+                p: cands.loc[cands["position"] == p, "candidate"].tolist()
+                for p in cands["position"].unique().tolist()
+            }
 
-        for position in cands["position"].unique().tolist():
-            options = cands.loc[cands["position"]==position, "candidate"].tolist()
-            st.markdown(f"#### {position}")
-            chosen = st.radio(
-                f"{position} এর জন্য প্রার্থী নির্বাচন করুন:",
-                options,
-                key=f"vote_{position}",
-                index=None
-            )
-            st.session_state.votes[position] = chosen
+            st.session_state.ballot = {
+                "ready": True,
+                "token": token.strip(),
+                "voters_snapshot": voters,      # to mark used without reloading
+                "pos_to_cands": pos_to_cands,
+            }
+            st.experimental_rerun()
 
-        if st.button("✅ Submit All Votes"):
-            missing = [p for p,c in st.session_state.votes.items() if c is None]
+    # ---------- Stage 2: full ballot in one form ----------
+    else:
+        st.success("✅ Token OK. Select your choices below.")
+
+        pos_to_cands = st.session_state.ballot["pos_to_cands"]
+
+        with st.form("full_ballot"):
+            # render all positions in one go; radios keep their own keys
+            for position, options in pos_to_cands.items():
+                st.markdown(f"#### {position}")
+                # key must be stable & unique
+                st.radio(
+                    f"{position} এর জন্য প্রার্থী নির্বাচন করুন:",
+                    options,
+                    key=f"choice_{position}",
+                    index=None,
+                    horizontal=True,
+                )
+
+            submitted = st.form_submit_button("✅ Submit All Votes")
+
+        # separate row of actions
+        c1, c2 = st.columns([1, 1])
+        if c2.button("❌ Cancel"):
+            st.session_state.ballot = {"ready": False}
+            st.experimental_rerun()
+
+        if submitted:
+            # build selections from session_state keys
+            selections = {
+                p: st.session_state.get(f"choice_{p}", None) for p in pos_to_cands.keys()
+            }
+            missing = [p for p, v in selections.items() if v is None]
             if missing:
                 st.error("দয়া করে ভোট দিন: " + ", ".join(missing))
             else:
-                for p,c in st.session_state.votes.items():
+                # write all votes once; then mark token used
+                for p, c in selections.items():
                     append_vote(p, c)
-                mark_token_used(voters, token)
+                mark_token_used(st.session_state.ballot["voters_snapshot"],
+                                st.session_state.ballot["token"])
                 st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
-                st.session_state.votes = {}
-                st.rerun()
+                # clear ballot state so the page resets cleanly
+                st.session_state.ballot = {"ready": False}
+                st.experimental_rerun()
+# ---------------------- end vote tab ----------------------
+
 
 # ------------------------ Results Tab ------------------------
 with tab_results:
