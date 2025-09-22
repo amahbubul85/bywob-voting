@@ -256,45 +256,90 @@ with tab_admin:
     st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
 
     # Schedule
-    ename = st.text_input("Election name", value=m.get("name",""))
-    sdt = st.date_input("Start date", value=now_cet().date())
-    stm = st.time_input("Start time", value=now_cet().time().replace(second=0,microsecond=0))
-    edt = st.date_input("End date", value=(now_cet()+timedelta(hours=2)).date())
-    etm = st.time_input("End time", value=(now_cet()+timedelta(hours=2)).time().replace(second=0,microsecond=0))
+    # ---- Create / Schedule new election (robust) ----
+    ename = st.text_input("Election name", value=m.get("name", ""))
+
+    # Use saved schedule if available; else fall back to now / +2h
+    def _parse_iso(s: str):
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
+    _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Start Time (CET)**")
+        sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
+        stm = st.time_input(
+            "Start time",
+            value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
+            key="start_time",
+        )
+    with col2:
+        st.markdown("**End Time (CET)**")
+        edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
+        etm = st.time_input(
+            "End time",
+            value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
+            key="end_time",
+        )
+
+    start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
+    end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
+
+    st.info(
+        f"**সময়সূচী (CET):**\n"
+        f"- শুরু: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
+        f"- শেষ:  {end_dt.strftime('%Y-%m-%d %H:%M')}"
+    )
+
     if st.button("Set & Schedule"):
-        start_dt = datetime.combine(sdt,stm).replace(tzinfo=CET)
-        end_dt = datetime.combine(edt,etm).replace(tzinfo=CET)
-        meta_set("name", ename)
-        meta_set("start_cet", start_dt.isoformat())
-        meta_set("end_cet", end_dt.isoformat())
-        meta_set("status","scheduled")
-        st.success("Election scheduled.")
+        # --- validation ---
+        if end_dt <= start_dt:
+            st.error("End time must be **after** start time.")
+        elif end_dt <= now_cet():
+            st.error("End time is already **in the past**. Pick a future end.")
+        else:
+            # Write meta without auto-flip
+            meta_set("name", ename)
+            meta_set("start_cet", start_dt.isoformat())
+            meta_set("end_cet",   end_dt.isoformat())
+            meta_set("status",    "scheduled")
+            meta_set("published", "FALSE")
+            st.success("Election scheduled (status = scheduled).")
+            st.rerun()
+
 
     c1,c2,c3 = st.columns(3)
     if c1.button("Start Now"):
         start_now = now_cet()
-        m = meta_get_all()
-        # keep an existing end if it's still in the future; otherwise set to +2h
-        end_existing = m.get("end_cet", "")
+        # keep current end if valid; otherwise set to +2h
+        end_cet_str = meta_get_all().get("end_cet", "")
         try:
-            end_dt = datetime.fromisoformat(end_existing) if end_existing else None
+            end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
         except Exception:
-            end_dt = None
+            end_kept = None
+        if not end_kept or end_kept <= start_now:
+            end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
-        if (end_dt is None) or (to_cet(end_dt) <= start_now):
-            end_dt = start_now + timedelta(hours=2)
-
-        meta_set("name", ename)  # keep current name
         meta_set("start_cet", start_now.isoformat())
-        meta_set("end_cet", end_dt.isoformat())
-        meta_set("status", "ongoing")
+        meta_set("end_cet",   end_kept.isoformat())
+        meta_set("status",    "ongoing")
+        st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
+        st.rerun()
 
-        st.success(f"Election started now! Ends at {end_dt.strftime('%Y-%m-%d %H:%M CET')}.")
-        st.rerun()  # <-- force UI to refresh the displayed status
 
     if c2.button("End Now"):
-        meta_set("end_cet", now_cet().isoformat()); meta_set("status","ended")
-        st.success("Election ended")
+        end_now = now_cet()  # CET-aware helper from your code
+        # keep name as-is; just stamp the end and close
+        meta_set("end_cet", end_now.isoformat())
+        meta_set("status", "ended")
+        st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
+        st.rerun()  # important so the header shows 'ended' immediately
+
     if c3.button("Publish Results"):
         meta_set("published","TRUE"); meta_set("status","ended")
         st.success("Results published")
