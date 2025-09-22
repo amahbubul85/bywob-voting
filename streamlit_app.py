@@ -272,14 +272,55 @@ with tab_admin:
 
     c1,c2,c3 = st.columns(3)
     if c1.button("Start Now"):
-        meta_set("start_cet", now_cet().isoformat()); meta_set("status","ongoing")
-        st.success("Election started now")
+        start_now = now_cet()
+        m = meta_get_all()
+        # keep an existing end if it's still in the future; otherwise set to +2h
+        end_existing = m.get("end_cet", "")
+        try:
+            end_dt = datetime.fromisoformat(end_existing) if end_existing else None
+        except Exception:
+            end_dt = None
+
+        if (end_dt is None) or (to_cet(end_dt) <= start_now):
+            end_dt = start_now + timedelta(hours=2)
+
+        meta_set("name", ename)  # keep current name
+        meta_set("start_cet", start_now.isoformat())
+        meta_set("end_cet", end_dt.isoformat())
+        meta_set("status", "ongoing")
+
+        st.success(f"Election started now! Ends at {end_dt.strftime('%Y-%m-%d %H:%M CET')}.")
+        st.rerun()  # <-- force UI to refresh the displayed status
+
     if c2.button("End Now"):
         meta_set("end_cet", now_cet().isoformat()); meta_set("status","ended")
         st.success("Election ended")
     if c3.button("Publish Results"):
         meta_set("published","TRUE"); meta_set("status","ended")
         st.success("Results published")
+
+
+    st.divider()
+    st.markdown("### 🗄️ Archive & Reset for a New Election")
+
+    if st.button("Archive votes & reset voters"):
+        # 1) archive votes into a new table
+        ts = now_cet().strftime("%Y%m%dT%H%M%S")
+        archive_table = f"votes_archive_{ts}"
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
+        conn.commit()
+
+        # 2) clear current votes
+        cur.execute("DELETE FROM votes")
+        conn.commit()
+
+        # 3) reset voter usage flags
+        cur.execute("UPDATE voters SET used = 0, used_at = ''")
+        conn.commit()
+
+        st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
+        st.rerun()
+
 
     # -------------------- Token generator --------------------
     st.markdown("### 🔑 Generate tokens")
