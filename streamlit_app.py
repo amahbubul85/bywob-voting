@@ -32,9 +32,25 @@ cur = conn.cursor()
 
 # Create tables
 cur.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS voters (id INTEGER PRIMARY KEY, name TEXT, email TEXT, token TEXT UNIQUE, used INTEGER DEFAULT 0, used_at TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS candidates (id INTEGER PRIMARY KEY, position TEXT, candidate TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS votes (id INTEGER PRIMARY KEY, position TEXT, candidate TEXT, timestamp TEXT)")
+cur.execute("""CREATE TABLE IF NOT EXISTS voters (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    token TEXT UNIQUE,
+    used INTEGER DEFAULT 0,
+    used_at TEXT
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY,
+    position TEXT,
+    candidate TEXT
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS votes (
+    id INTEGER PRIMARY KEY,
+    position TEXT,
+    candidate TEXT,
+    timestamp TEXT
+)""")
 conn.commit()
 
 # --------------------------------------------------------------------------------------
@@ -201,11 +217,31 @@ with tab_admin:
         generate_tokens(num, pref)
         st.success("Tokens generated")
 
+    # -------------------- Candidate management --------------------
     st.markdown("### 📋 Candidates")
+    with st.form("add_candidate"):
+        col1, col2 = st.columns(2)
+        pos = col1.text_input("Position", placeholder="e.g., President")
+        cand = col2.text_input("Candidate", placeholder="e.g., Alice")
+        submitted = st.form_submit_button("Add Candidate")
+
+        if submitted:
+            if pos.strip() and cand.strip():
+                cur.execute("INSERT INTO candidates (position, candidate) VALUES (?, ?)", (pos.strip(), cand.strip()))
+                conn.commit()
+                st.success(f"Candidate '{cand}' added for position '{pos}'")
+                st.rerun()
+            else:
+                st.error("Please enter both position and candidate name.")
+
     st.dataframe(load_candidates_df(), use_container_width=True)
+
+    # -------------------- Voters --------------------
     st.markdown("### 👥 Voters")
     safe = load_voters_df().copy()
     if not safe.empty: safe["token"] = "••••••••"
     st.dataframe(safe, use_container_width=True)
+
+    # -------------------- Results --------------------
     st.markdown("### 📈 Results")
     st.dataframe(results_df(), use_container_width=True)
