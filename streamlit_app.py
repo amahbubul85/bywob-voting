@@ -417,29 +417,42 @@ with tab_admin:
 
     c3, c4, c5 = st.columns(3)
 
+    # --- START NOW ---
     if c3.button("Start Election Now"):
-        now = now_cet()
-        # Overwrite start to NOW, keep the end from the inputs
-        meta_set("name", ename)
-        meta_set("start_cet", now.isoformat())
-        meta_set("end_cet",   end_dt_cet.isoformat())
-        meta_set("status",    "ongoing")
-        st.success(f"Election started now ({now.strftime('%Y-%m-%d %H:%M CET')}). End stays at {end_dt_cet.strftime('%Y-%m-%d %H:%M CET')}.")
+        start_now = now_cet()
+        end_existing = m.get("end_cet", "")
+
+        # keep scheduled end if exists, otherwise end of today
+        if end_existing:
+            end_cet = datetime.fromisoformat(end_existing)
+        else:
+            end_cet = start_now.replace(hour=23, minute=59, second=0, microsecond=0)
+
+        meta_set("start_cet", start_now.isoformat())
+        meta_set("end_cet", end_cet.isoformat())
+        meta_set("status", "ongoing")
+
+        st.success(f"Election started now! Ends at {end_cet.strftime('%Y-%m-%d %H:%M CET')}.")
+        clear_caches()
         st.rerun()
 
+    # --- END NOW ---
     if c4.button("End Election Now"):
-        now = now_cet()
-        # Overwrite end to NOW
-        meta_set("end_cet", now.isoformat())
-        meta_set("status",  "ended")
-        st.success(f"Election ended now ({now.strftime('%Y-%m-%d %H:%M CET')}).")
+        end_now = now_cet()
+        meta_set("end_cet", end_now.isoformat())
+        meta_set("status", "ended")
+        st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
+        clear_caches()
         st.rerun()
 
+    # --- PUBLISH ---
     if c5.button("Publish Results (declare)"):
         meta_set("published", "TRUE")
-        meta_set("status",    "ended")
-        st.success("Results published.")
+        meta_set("status", "ended")
+        st.success("Results published. You can now export/archive.")
+        clear_caches()
         st.rerun()
+
 
     st.divider()
     st.markdown("### 🔑 Token Generator")
