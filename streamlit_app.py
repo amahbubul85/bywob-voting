@@ -293,7 +293,7 @@ with tab_vote:
                 "voters_snapshot": voters,      # to mark used without reloading
                 "pos_to_cands": pos_to_cands,
             }
-            st.experimental_rerun()
+            st.rerun()
 
     # ---------- Stage 2: full ballot in one form ----------
     else:
@@ -320,7 +320,7 @@ with tab_vote:
         c1, c2 = st.columns([1, 1])
         if c2.button("❌ Cancel"):
             st.session_state.ballot = {"ready": False}
-            st.experimental_rerun()
+            st.rerun()
 
         if submitted:
             # build selections from session_state keys
@@ -339,7 +339,7 @@ with tab_vote:
                 st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে। ধন্যবাদ!")
                 # clear ballot state so the page resets cleanly
                 st.session_state.ballot = {"ready": False}
-                st.experimental_rerun()
+                st.rerun()
 # ---------------------- end vote tab ----------------------
 
 
