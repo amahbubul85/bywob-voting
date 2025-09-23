@@ -4,8 +4,8 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo  # ✅ added for proper CET/CEST handling
 import secrets, string
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
@@ -13,9 +13,10 @@ st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
 
 # --------------------------------------------------------------------------------------
-# Local timezone (handles DST automatically)
+# CET Timezone
 # --------------------------------------------------------------------------------------
-CET = ZoneInfo("Europe/Paris")  # auto-switches CET/CEST
+# CET/CEST with DST handled automatically for France:
+CET = ZoneInfo("Europe/Paris")  # ✅ replaced fixed UTC+1 with proper zone
 
 def now_cet():
     return datetime.now(CET).replace(microsecond=0)
@@ -31,35 +32,29 @@ def to_cet(dt: datetime):
 conn = sqlite3.connect("election.db", check_same_thread=False)
 cur = conn.cursor()
 
+# Create tables
 cur.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-cur.execute(
-    """CREATE TABLE IF NOT EXISTS voters (
-        id INTEGER PRIMARY KEY,
-        name TEXT,
-        email TEXT,
-        token TEXT UNIQUE,
-        used INTEGER DEFAULT 0,
-        used_at TEXT
-    )"""
-)
-cur.execute(
-    """CREATE TABLE IF NOT EXISTS candidates (
-        id INTEGER PRIMARY KEY,
-        position TEXT,
-        candidate TEXT
-    )"""
-)
-cur.execute(
-    """CREATE TABLE IF NOT EXISTS votes (
-        id INTEGER PRIMARY KEY,
-        position TEXT,
-        candidate TEXT,
-        timestamp TEXT
-    )"""
-)
-
+cur.execute("""CREATE TABLE IF NOT EXISTS voters (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    token TEXT UNIQUE,
+    used INTEGER DEFAULT 0,
+    used_at TEXT
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY,
+    position TEXT,
+    candidate TEXT
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS votes (
+    id INTEGER PRIMARY KEY,
+    position TEXT,
+    candidate TEXT,
+    timestamp TEXT
+)""")
+# optional: prevent exact duplicates (position, candidate)
 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_candidates ON candidates(position, candidate)")
-cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_voters_email ON voters(email)")
 conn.commit()
 
 # --------------------------------------------------------------------------------------
@@ -69,35 +64,28 @@ def meta_get_all() -> dict:
     return dict(cur.execute("SELECT key,value FROM meta").fetchall())
 
 def meta_set(k: str, v: str):
-    cur.execute("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", (k, v))
+    cur.execute("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", (k,v))
     conn.commit()
 
 m0 = meta_get_all()
 defaults = {
-    "status": "idle",
-    "name": "",
-    "start_cet": "",
-    "end_cet": "",
-    "published": "FALSE",
+    "status":"idle",  # idle | scheduled | ongoing | ended | published
+    "name":"", "start_cet":"", "end_cet":"", "published":"FALSE"
 }
-for k, v in defaults.items():
-    if k not in m0:
-        meta_set(k, v)
+for k,v in defaults.items():
+    if k not in m0: meta_set(k,v)
 
 def is_voting_open() -> bool:
     m = meta_get_all()
-    if m.get("status", "idle") != "ongoing":
-        return False
+    if m.get("status","idle") != "ongoing": return False
     try:
-        sdt = datetime.fromisoformat(m.get("start_cet", "")) if m.get("start_cet") else None
-        edt = datetime.fromisoformat(m.get("end_cet", "")) if m.get("end_cet") else None
-    except Exception:
-        return False
+        sdt = datetime.fromisoformat(m.get("start_cet","")) if m.get("start_cet") else None
+        edt = datetime.fromisoformat(m.get("end_cet","")) if m.get("end_cet") else None
+    except Exception: return False
     now = now_cet()
-    if sdt and now < to_cet(sdt):
-        return False
+    if sdt and now < to_cet(sdt): return False
     if edt and now > to_cet(edt):
-        meta_set("status", "ended")
+        meta_set("status","ended")
         return False
     return True
 
@@ -106,16 +94,15 @@ def is_voting_open() -> bool:
 # --------------------------------------------------------------------------------------
 def load_voters_df():
     df = pd.read_sql("SELECT * FROM voters", conn)
-    if df.empty:
-        return pd.DataFrame(columns=["id", "name", "email", "token", "used", "used_at", "used_bool"])
-    df["used_bool"] = df["used"] == 1
+    if df.empty: return pd.DataFrame(columns=["id","name","email","token","used","used_at","used_bool"])
+    df["used_bool"] = df["used"]==1
     df["token"] = df["token"].astype(str)
     return df
 
 def load_candidates_df():
     df = pd.read_sql("SELECT * FROM candidates", conn)
     if df.empty:
-        return pd.DataFrame(columns=["id", "position", "candidate"])
+        return pd.DataFrame(columns=["id","position","candidate"])
     df["position"] = df["position"].astype(str).str.strip()
     df["candidate"] = df["candidate"].astype(str).str.strip()
     return df
@@ -141,29 +128,45 @@ def append_vote(position: str, candidate: str):
     conn.commit()
 
 def generate_tokens(n: int, prefix: str):
+    """Return list of newly generated tokens."""
     alpha = string.ascii_uppercase + string.digits
     new_tokens = []
     for _ in range(int(n)):
-        while True:
+        tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
+        try:
+            cur.execute(
+                "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                ("","",tok,0,""),
+            )
+            new_tokens.append(tok)
+        except sqlite3.IntegrityError:
             tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
-            try:
-                cur.execute(
-                    "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-                    ("", "", tok, 0, ""),
-                )
-                conn.commit()
-                new_tokens.append(tok)
-                break
-            except sqlite3.IntegrityError:
-                continue
+            cur.execute(
+                "INSERT OR IGNORE INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                ("","",tok,0,""),
+            )
+            new_tokens.append(tok)
+    conn.commit()
     return new_tokens
+
+def add_voter(name: str, email: str, token: str | None, prefix: str):
+    """Add single voter; if token None, auto-generate one."""
+    if not token:
+        token = generate_tokens(1, prefix)[0]
+    else:
+        token = token.strip()
+        cur.execute(
+            "INSERT OR IGNORE INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+            (name.strip(), email.strip(), token, 0, ""),
+        )
+        conn.commit()
+    return token
 
 def results_df():
     df = load_votes_df()
-    if df.empty:
-        return pd.DataFrame(columns=["position", "candidate", "votes"])
-    g = df.groupby(["position", "candidate"]).size().reset_index(name="votes")
-    return g.sort_values(["position", "votes"], ascending=[True, False])
+    if df.empty: return pd.DataFrame(columns=["position","candidate","votes"])
+    g = df.groupby(["position","candidate"]).size().reset_index(name="votes")
+    return g.sort_values(["position","votes"], ascending=[True,False])
 
 # ---- Candidate CRUD helpers ----
 def add_candidate(position: str, candidate: str):
@@ -184,29 +187,7 @@ def delete_candidate(row_id: int):
     cur.execute("DELETE FROM candidates WHERE id = ?", (int(row_id),))
     conn.commit()
 
-# ---- Voter CRUD helpers ----
-def get_voter_by_email(email: str):
-    return cur.execute("SELECT * FROM voters WHERE email = ?", (email.strip(),)).fetchone()
-
-def upsert_voter(name: str, email: str, token: str | None, prefix: str) -> str:
-    name = (name or "").strip()
-    email = (email or "").strip()
-    tok = (token or "").strip()
-    if not email:
-        raise ValueError("Email is required")
-    if not tok:
-        tok = generate_tokens(1, prefix)[0]
-    existing = cur.execute("SELECT id FROM voters WHERE email = ?", (email,)).fetchone()
-    if existing:
-        cur.execute("UPDATE voters SET name=?, token=? WHERE id=?", (name, tok, int(existing[0])))
-    else:
-        cur.execute(
-            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-            (name, email, tok, 0, ""),
-        )
-    conn.commit()
-    return tok
-
+# ✅ Voter edit helpers (added)
 def update_voter(row_id: int, name: str, email: str, token: str):
     cur.execute(
         "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
@@ -259,7 +240,8 @@ with tab_vote:
                 st.stop()
 
             pos_to_cands = {
-                p: cands[cands["position"] == p]["candidate"].tolist() for p in cands["position"].unique()
+                p: cands[cands["position"]==p]["candidate"].tolist()
+                for p in cands["position"].unique()
             }
             st.session_state.ballot = {
                 "ready": True,
@@ -297,7 +279,7 @@ with tab_vote:
 with tab_results:
     st.subheader("📊 Live Results")
     r = results_df()
-    st.dataframe(r if not r.empty else pd.DataFrame([{"info": "No votes yet"}]), use_container_width=True)
+    st.dataframe(r if not r.empty else pd.DataFrame([{"info":"No votes yet"}]), width='stretch')
 
 # ------------------------ Admin Tab ------------------------
 with tab_admin:
@@ -305,7 +287,7 @@ with tab_admin:
     m = meta_get_all()
     st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
 
-    # ---- Schedule election ----
+    # ---- Create / Schedule new election (robust) ----
     ename = st.text_input("Election name", value=m.get("name", ""))
 
     def _parse_iso(s: str):
@@ -315,36 +297,50 @@ with tab_admin:
             return None
 
     _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
-    _edt_saved = _parse_iso(m.get("end_cet", "")) or (now_cet() + timedelta(hours=2))
+    _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Start Time (CET)**")
-        sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date())
-        stm = st.time_input("Start time", value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0))
+        sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
+        stm = st.time_input(
+            "Start time",
+            value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
+            key="start_time",
+        )
     with col2:
         st.markdown("**End Time (CET)**")
-        edt = st.date_input("End date", value=to_cet(_edt_saved).date())
-        etm = st.time_input("End time", value=to_cet(_edt_saved).time().replace(second=0, microsecond=0))
+        edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
+        etm = st.time_input(
+            "End time",
+            value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
+            key="end_time",
+        )
 
     start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
-    end_dt = datetime.combine(edt, etm).replace(tzinfo=CET)
+    end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
+
+    st.info(
+        f"**সময়সূচী (CET):**\n"
+        f"- শুরু: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
+        f"- শেষ:  {end_dt.strftime('%Y-%m-%d %H:%M')}"
+    )
 
     if st.button("Set & Schedule"):
         if end_dt <= start_dt:
-            st.error("End time must be after start time.")
+            st.error("End time must be **after** start time.")
         elif end_dt <= now_cet():
-            st.error("End time already in the past.")
+            st.error("End time is already **in the past**. Pick a future end.")
         else:
             meta_set("name", ename)
             meta_set("start_cet", start_dt.isoformat())
-            meta_set("end_cet", end_dt.isoformat())
-            meta_set("status", "scheduled")
+            meta_set("end_cet",   end_dt.isoformat())
+            meta_set("status",    "scheduled")
             meta_set("published", "FALSE")
-            st.success("Election scheduled.")
+            st.success("Election scheduled (status = scheduled).")
             st.rerun()
 
-    c1, c2, c3 = st.columns(3)
+    c1,c2,c3 = st.columns(3)
     if c1.button("Start Now"):
         start_now = now_cet()
         end_cet_str = meta_get_all().get("end_cet", "")
@@ -355,26 +351,27 @@ with tab_admin:
         if not end_kept or end_kept <= start_now:
             end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
-        meta_set("name", ename or m.get("name", ""))
+        meta_set("name", ename or m.get("name",""))
         meta_set("start_cet", start_now.isoformat())
-        meta_set("end_cet", end_kept.isoformat())
-        meta_set("status", "ongoing")
-        st.success(f"Election started. Ends {end_kept.strftime('%Y-%m-%d %H:%M')}.")
+        meta_set("end_cet",   end_kept.isoformat())
+        meta_set("status",    "ongoing")
+        st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
         st.rerun()
 
     if c2.button("End Now"):
         end_now = now_cet()
         meta_set("end_cet", end_now.isoformat())
         meta_set("status", "ended")
-        st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M')}.")
+        st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
         st.rerun()
 
     if c3.button("Publish Results"):
-        meta_set("published", "TRUE"); meta_set("status", "ended")
-        st.success("Results published.")
+        meta_set("published","TRUE"); meta_set("status","ended")
+        st.success("Results published")
 
     st.divider()
-    st.markdown("### 🗄️ Archive & Reset")
+    st.markdown("### 🗄️ Archive & Reset for a New Election")
+
     if st.button("Archive votes & reset voters"):
         ts = now_cet().strftime("%Y%m%dT%H%M%S")
         archive_table = f"votes_archive_{ts}"
@@ -384,7 +381,7 @@ with tab_admin:
         conn.commit()
         cur.execute("UPDATE voters SET used = 0, used_at = ''")
         conn.commit()
-        st.success(f"Archived to {archive_table}, reset tokens.")
+        st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
         st.rerun()
 
     # -------------------- Token generator --------------------
@@ -395,48 +392,105 @@ with tab_admin:
     if st.button("Generate"):
         new_tokens = generate_tokens(num, pref)
         st.success(f"{len(new_tokens)} tokens generated")
-        st.code("\n".join(new_tokens))
+        st.caption("Copy the tokens below:")
+        st.code("\n".join(new_tokens) if new_tokens else "—")
 
-    # -------------------- CSV import --------------------
-    st.markdown("### 📥 Import voters (CSV)")
-    st.caption("CSV columns: name,email,[token]")
-    csv_file = st.file_uploader("Upload CSV", type=["csv"])
-    auto_pref = st.text_input("Auto-token prefix", value="BYWOB-2025")
+    # -------------------- Add single voter --------------------
+    st.markdown("### ➕ Add single voter")
+    with st.form("add_single_voter"):
+        sv1, sv2 = st.columns(2)
+        name_in = sv1.text_input("Name")
+        email_in = sv2.text_input("Email")
+        sv3, sv4 = st.columns(2)
+        manual_token = sv3.text_input("Token (optional, leave blank to auto-generate)")
+        auto_prefix = sv4.text_input("Auto prefix (if blank token)", value="BYWOB-2025")
+        add_clicked = st.form_submit_button("Add voter")
+    if add_clicked:
+        tok = add_voter(name_in, email_in, manual_token or None, auto_prefix)
+        st.success(f"Voter added. Token: {tok}")
+        st.code(tok)
 
-    if csv_file:
-        up_df = pd.read_csv(csv_file).fillna("")
-        cols = {c.lower().strip(): c for c in up_df.columns}
-        if "name" in cols and "email" in cols:
-            token_col = cols.get("token")
-            st.dataframe(up_df, use_container_width=True)
-            if st.button("Import / Upsert"):
-                added, updated = 0, 0
-                for _, r in up_df.iterrows():
-                    name = str(r[cols["name"]]).strip()
-                    email = str(r[cols["email"]]).strip()
-                    token = str(r[token_col]).strip() if token_col else ""
-                    existed = get_voter_by_email(email)
-                    upsert_voter(name, email, token if token else None, auto_pref)
-                    if existed: updated += 1
-                    else: added += 1
-                st.success(f"Imported — {added} added, {updated} updated.")
+    # -------------------- Candidates (CRUD) --------------------
+    st.markdown("### 📋 Candidates (persisted)")
+
+    all_cands = load_candidates_df()
+    all_positions = sorted(all_cands["position"].dropna().astype(str).unique().tolist()) if not all_cands.empty else []
+    colf1, colf2 = st.columns([2, 3])
+    with colf1:
+        pos_filter = st.selectbox("Filter by position (optional)", options=["(all)"] + all_positions, index=0)
+    with colf2:
+        st.caption("Use Edit/Save/Delete for individual rows. Add new entries below.")
+
+    # Add new candidate
+    st.markdown("#### ➕ Add new")
+    cnew1, cnew2, cnew3 = st.columns([2, 2, 1])
+    with cnew1:
+        new_pos = st.text_input("Position", key="new_pos")
+    with cnew2:
+        new_cand = st.text_input("Candidate", key="new_cand")
+    with cnew3:
+        if st.button("Add"):
+            if not new_pos.strip() or not new_cand.strip():
+                st.error("Position এবং Candidate দুটোই দিন।")
+            else:
+                add_candidate(new_pos, new_cand)
+                st.success("Added.")
                 st.rerun()
-        else:
-            st.error("CSV must have name and email columns.")
 
-        # -------------------- Voters --------------------
+    st.divider()
+    st.markdown("#### ✏️ Edit / 🗑️ Delete")
+
+    # Apply filter
+    view_df = all_cands.copy()
+    if pos_filter != "(all)":
+        view_df = view_df[view_df["position"] == pos_filter]
+
+    if view_df.empty:
+        st.info("No candidates yet for this filter.")
+    else:
+        for _, r in view_df.sort_values(["position", "candidate"]).iterrows():
+            rid = int(r["id"])
+            with st.container(border=True):
+                ec1, ec2, ec3, ec4 = st.columns([2, 2, 1, 1])
+                with ec1:
+                    p_val = st.text_input("Position", value=str(r["position"]), key=f"pos_{rid}")
+                with ec2:
+                    c_val = st.text_input("Candidate", value=str(r["candidate"]), key=f"cand_{rid}")
+                with ec3:
+                    if st.button("Save", key=f"save_{rid}"):
+                        if not p_val.strip() or not c_val.strip():
+                            st.error("Position এবং Candidate ফাঁকা রাখা যাবে না।")
+                        else:
+                            update_candidate(rid, p_val, c_val)
+                            st.success("Saved.")
+                            st.rerun()
+                with ec4:
+                    if st.button("Delete", key=f"del_{rid}"):
+                        delete_candidate(rid)
+                        st.warning("Deleted.")
+                        st.rerun()
+
+    # -------------------- Voters (show/hide tokens + export + inline edit) --------------------
     st.markdown("### 👥 Voters")
-    show_tokens = st.checkbox("Show tokens", value=False)
+    show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens for copying/exporting.")
     voters_df = load_voters_df()
     if voters_df.empty:
         st.info("কোনো ভোটার নেই।")
     else:
+        display_df = voters_df.copy()
+        if not show_tokens:
+            display_df["token"] = "••••••••"
+        st.dataframe(display_df[["id","name","email","token","used","used_at"]], width='stretch')
+
+        # ✅ Inline edit/delete each voter
         for _, r in voters_df.sort_values("id").iterrows():
             rid = int(r["id"])
             with st.container(border=True):
-                vc1, vc2, vc3, vc4, vc5 = st.columns([2,3,3,3,2])
+                vc1, vc2, vc3, vc4, vc5 = st.columns([2, 3, 3, 3, 2])
                 with vc1:
-                    st.caption(f"ID {rid} • Used: {'✅' if r['used']==1 else '—'} {r['used_at']}")
+                    st.caption(f"ID {rid}")
+                    st.caption(f"Used: {'✅' if r['used']==1 else '—'}")
+                    st.caption(f"At: {r['used_at'] or '—'}")
                 with vc2:
                     name_val = st.text_input("Name", value=str(r["name"] or ""), key=f"vn_{rid}")
                 with vc3:
@@ -454,10 +508,25 @@ with tab_admin:
                         if not email_val.strip():
                             st.error("Email required")
                         else:
-                            update_voter(rid, name_val, email_val, tok_val)
-                            st.success("Voter updated.")
-                            st.rerun()
+                            try:
+                                update_voter(rid, name_val, email_val, tok_val)
+                                st.success("Voter updated.")
+                                st.rerun()
+                            except sqlite3.IntegrityError as e:
+                                st.error(f"Save failed (token must be unique): {e}")
                     if st.button("Delete", key=f"vdel_{rid}"):
                         delete_voter(rid)
                         st.warning("Voter deleted.")
                         st.rerun()
+
+        csv_bytes = voters_df[["id","name","email","token","used","used_at"]].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download tokens.csv",
+            data=csv_bytes,
+            file_name="tokens.csv",
+            mime="text/csv",
+        )
+
+    # -------------------- Results --------------------
+    st.markdown("### 📈 Results")
+    st.dataframe(results_df(), width='stretch')
