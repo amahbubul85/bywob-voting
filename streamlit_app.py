@@ -424,7 +424,7 @@ with tab_admin:
         else:
             st.error("CSV must have name and email columns.")
 
-    # -------------------- Voters --------------------
+        # -------------------- Voters --------------------
     st.markdown("### 👥 Voters")
     show_tokens = st.checkbox("Show tokens", value=False)
     voters_df = load_voters_df()
@@ -447,9 +447,17 @@ with tab_admin:
                         value=str(r["token"]) if show_tokens else "••••••••",
                         key=f"vt_{rid}",
                     )
-                    if not show_tokens: tok_val = str(r["token"])
+                    if not show_tokens:
+                        tok_val = str(r["token"])
                 with vc5:
                     if st.button("Save", key=f"vsave_{rid}"):
                         if not email_val.strip():
                             st.error("Email required")
                         else:
+                            update_voter(rid, name_val, email_val, tok_val)
+                            st.success("Voter updated.")
+                            st.rerun()
+                    if st.button("Delete", key=f"vdel_{rid}"):
+                        delete_voter(rid)
+                        st.warning("Voter deleted.")
+                        st.rerun()
