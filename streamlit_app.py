@@ -168,6 +168,34 @@ def results_df():
     g = df.groupby(["position","candidate"]).size().reset_index(name="votes")
     return g.sort_values(["position","votes"], ascending=[True,False])
 
+
+# ---- extra helpers for CSV + bulk upsert ----
+def get_voter_by_email(email: str):
+    return cur.execute("SELECT id FROM voters WHERE TRIM(LOWER(email)) = TRIM(LOWER(?))", (email.strip(),)).fetchone()
+
+def upsert_voter_by_email(name: str, email: str, token: str | None, auto_prefix: str) -> str:
+    """Create/update a voter by email. If token is missing, auto-generate one."""
+    name = (name or "").strip()
+    email = (email or "").strip()
+    tok = (token or "").strip() if token else ""
+    if not email:
+        return ""
+
+    if not tok:
+        tok = generate_tokens(1, auto_prefix)[0]
+
+    existing = get_voter_by_email(email)
+    if existing:
+        cur.execute("UPDATE voters SET name=?, token=? WHERE id=?", (name, tok, int(existing[0])))
+    else:
+        cur.execute(
+            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+            (name, email, tok, 0, ""),
+        )
+    conn.commit()
+    return tok
+
+
 # ---- Candidate CRUD helpers ----
 def add_candidate(position: str, candidate: str):
     cur.execute(
@@ -470,62 +498,112 @@ with tab_admin:
                         st.warning("Deleted.")
                         st.rerun()
 
-    # -------------------- Voters (show/hide tokens + export + inline edit) --------------------
+    # -------------------- Voters (inline edit + CSV in-place) --------------------
     st.markdown("### 👥 Voters")
-    show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens for copying/exporting.")
+
+    c_left, c_right = st.columns([3, 2])
+    with c_left:
+        show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens for editing/copying.")
+        edit_mode   = st.checkbox("Edit directly in the table", value=False)
+
+    with c_right:
+        csv_file   = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"])
+        auto_pref  = st.text_input("Auto-token prefix", value="BYWOB-2025")
+
+        if csv_file is not None:
+            try:
+                up_df = pd.read_csv(csv_file).fillna("")
+                cols = {c.lower().strip(): c for c in up_df.columns}
+                if "name" in cols and "email" in cols:
+                    imported, updated = 0, 0
+                    for _, r in up_df.iterrows():
+                        name  = str(r[cols["name"]]).strip()
+                        email = str(r[cols["email"]]).strip()
+                        token = str(r[cols["token"]]).strip() if "token" in cols else ""
+                        existed = get_voter_by_email(email)
+                        upsert_voter_by_email(name, email, token if token else None, auto_pref)
+                        if existed: updated += 1
+                        else: imported += 1
+                    st.success(f"CSV merged: {imported} added, {updated} updated.")
+                    st.rerun()
+                else:
+                    st.error("CSV must contain at least the columns: name, email")
+            except Exception as e:
+                st.error(f"CSV read failed: {e}")
+
     voters_df = load_voters_df()
     if voters_df.empty:
         st.info("কোনো ভোটার নেই।")
     else:
-        display_df = voters_df.copy()
+        cols = ["id","name","email","token","used","used_at"]
+
+        # When editing, tokens should be visible so users can change them safely.
+        table_df = voters_df[cols].copy()
         if not show_tokens:
-            display_df["token"] = "••••••••"
-        st.dataframe(display_df[["id","name","email","token","used","used_at"]], width='stretch')
+            table_df["token"] = "••••••••"
 
-        # ✅ Inline edit/delete each voter
-        for _, r in voters_df.sort_values("id").iterrows():
-            rid = int(r["id"])
-            with st.container(border=True):
-                vc1, vc2, vc3, vc4, vc5 = st.columns([2, 3, 3, 3, 2])
-                with vc1:
-                    st.caption(f"ID {rid}")
-                    st.caption(f"Used: {'✅' if r['used']==1 else '—'}")
-                    st.caption(f"At: {r['used_at'] or '—'}")
-                with vc2:
-                    name_val = st.text_input("Name", value=str(r["name"] or ""), key=f"vn_{rid}")
-                with vc3:
-                    email_val = st.text_input("Email", value=str(r["email"] or ""), key=f"ve_{rid}")
-                with vc4:
-                    tok_val = st.text_input(
-                        "Token",
-                        value=str(r["token"]) if show_tokens else "••••••••",
-                        key=f"vt_{rid}",
-                    )
-                    if not show_tokens:
-                        tok_val = str(r["token"])
-                with vc5:
-                    if st.button("Save", key=f"vsave_{rid}"):
-                        if not email_val.strip():
-                            st.error("Email required")
-                        else:
-                            try:
-                                update_voter(rid, name_val, email_val, tok_val)
-                                st.success("Voter updated.")
-                                st.rerun()
-                            except sqlite3.IntegrityError as e:
-                                st.error(f"Save failed (token must be unique): {e}")
-                    if st.button("Delete", key=f"vdel_{rid}"):
-                        delete_voter(rid)
-                        st.warning("Voter deleted.")
-                        st.rerun()
+        if edit_mode:
+            if not show_tokens:
+                st.info("Tokens are masked. Tick **Show tokens** to edit tokens.")
+            # editable view
+            edited = st.data_editor(
+                voters_df[cols],  # real values for editing
+                key="voters_editor",
+                use_container_width=True,
+                num_rows="dynamic",  # allow adding rows
+                disabled=["id", "used", "used_at"],  # those are managed by the app
+                column_config={
+                    "id": st.column_config.NumberColumn("id", help="Auto-increment primary key"),
+                    "used": st.column_config.NumberColumn("used"),
+                    "used_at": st.column_config.TextColumn("used_at"),
+                },
+            )
+            # Apply button
+            if st.button("💾 Save changes"):
+                try:
+                    # 1) Update existing rows by id
+                    existing_ids = set(int(i) for i in voters_df["id"].tolist())
+                    to_update = edited[edited["id"].notna()].copy()
+                    for _, r in to_update.iterrows():
+                        rid = int(r["id"])
+                        if rid in existing_ids:
+                            cur.execute(
+                                "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
+                                (str(r["name"] or "").strip(),
+                                str(r["email"] or "").strip(),
+                                str(r["token"] or "").strip(),
+                                rid),
+                            )
 
-        csv_bytes = voters_df[["id","name","email","token","used","used_at"]].to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download tokens.csv",
-            data=csv_bytes,
-            file_name="tokens.csv",
-            mime="text/csv",
-        )
+                    # 2) Insert new rows where id is blank/NaN
+                    to_insert = edited[edited["id"].isna()].copy()
+                    for _, r in to_insert.iterrows():
+                        name  = str(r.get("name","")).strip()
+                        email = str(r.get("email","")).strip()
+                        token = str(r.get("token","")).strip()
+                        if not email and not token and not name:
+                            continue  # skip completely empty rows
+                        if not token:
+                            token = generate_tokens(1, auto_pref)[0]
+                        cur.execute(
+                            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                            (name, email, token, 0, ""),
+                        )
+
+                    conn.commit()
+                    st.success("Voter table saved.")
+                    st.rerun()
+                except sqlite3.IntegrityError as e:
+                    st.error(f"Save failed (token must be unique): {e}")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+        else:
+            # read-only view (masked or unmasked)
+            st.dataframe(table_df, use_container_width=True)
+
+        # Export (always real tokens)
+        csv_bytes = voters_df[cols].to_csv(index=False).encode("utf-8")
+        st.download_button("Download voters.csv", data=csv_bytes, file_name="voters.csv", mime="text/csv")
 
     # -------------------- Results --------------------
     st.markdown("### 📈 Results")
