@@ -514,22 +514,39 @@ with tab_admin:
             try:
                 up_df = pd.read_csv(csv_file).fillna("")
                 cols = {c.lower().strip(): c for c in up_df.columns}
-                if "name" in cols and "email" in cols:
-                    imported, updated = 0, 0
-                    for _, r in up_df.iterrows():
-                        name  = str(r[cols["name"]]).strip()
-                        email = str(r[cols["email"]]).strip()
-                        token = str(r[cols["token"]]).strip() if "token" in cols else ""
-                        existed = get_voter_by_email(email)
-                        upsert_voter_by_email(name, email, token if token else None, auto_pref)
-                        if existed: updated += 1
-                        else: imported += 1
-                    st.success(f"CSV merged: {imported} added, {updated} updated.")
-                    st.rerun()
+                if "name" not in cols or "email" not in cols:
+                    st.error("CSV must contain at least: name, email")
                 else:
-                    st.error("CSV must contain at least the columns: name, email")
+                    name_c  = cols["name"]
+                    email_c = cols["email"]
+                    token_c = cols.get("token")  # optional
+
+                    # Wipe current voters table completely
+                    cur.execute("DELETE FROM voters")
+                    conn.commit()
+
+                    inserted = 0
+                    for _, r in up_df.iterrows():
+                        name  = str(r[name_c]).strip()
+                        email = str(r[email_c]).strip()
+                        token = str(r[token_c]).strip() if token_c else ""
+                        if not token:
+                            token = generate_tokens(1, auto_pref)[0]
+                            # remove the auto-inserted row from generate_tokens
+                            cur.execute("DELETE FROM voters WHERE token=?", (token,))
+                            conn.commit()
+                        cur.execute(
+                            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                            (name, email, token, 0, ""),
+                        )
+                        inserted += 1
+
+                    conn.commit()
+                    st.success(f"Imported {inserted} voters (old voters table cleared).")
+                    st.rerun()
             except Exception as e:
                 st.error(f"CSV read failed: {e}")
+
 
     voters_df = load_voters_df()
     if voters_df.empty:
