@@ -51,6 +51,8 @@ cur.execute("""CREATE TABLE IF NOT EXISTS votes (
     candidate TEXT,
     timestamp TEXT
 )""")
+# optional: prevent exact duplicates (position, candidate)
+cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_candidates ON candidates(position, candidate)")
 conn.commit()
 
 # --------------------------------------------------------------------------------------
@@ -92,7 +94,6 @@ def load_voters_df():
     df = pd.read_sql("SELECT * FROM voters", conn)
     if df.empty: return pd.DataFrame(columns=["id","name","email","token","used","used_at","used_bool"])
     df["used_bool"] = df["used"]==1
-    # Normalize token strings (avoid None issues)
     df["token"] = df["token"].astype(str)
     return df
 
@@ -137,7 +138,6 @@ def generate_tokens(n: int, prefix: str):
             )
             new_tokens.append(tok)
         except sqlite3.IntegrityError:
-            # Rare collision: try again once
             tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
             cur.execute(
                 "INSERT OR IGNORE INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
@@ -166,6 +166,25 @@ def results_df():
     g = df.groupby(["position","candidate"]).size().reset_index(name="votes")
     return g.sort_values(["position","votes"], ascending=[True,False])
 
+# ---- Candidate CRUD helpers ----
+def add_candidate(position: str, candidate: str):
+    cur.execute(
+        "INSERT OR IGNORE INTO candidates (position, candidate) VALUES (?, ?)",
+        (position.strip(), candidate.strip()),
+    )
+    conn.commit()
+
+def update_candidate(row_id: int, position: str, candidate: str):
+    cur.execute(
+        "UPDATE candidates SET position = ?, candidate = ? WHERE id = ?",
+        (position.strip(), candidate.strip(), int(row_id)),
+    )
+    conn.commit()
+
+def delete_candidate(row_id: int):
+    cur.execute("DELETE FROM candidates WHERE id = ?", (int(row_id),))
+    conn.commit()
+
 # --------------------------------------------------------------------------------------
 # UI Tabs
 # --------------------------------------------------------------------------------------
@@ -193,7 +212,6 @@ with tab_vote:
                 st.stop()
 
             voters = load_voters_df()
-            # case-insensitive, whitespace-tolerant match
             row = voters[voters["token"].str.strip().str.upper() == token.strip().upper()]
             if row.empty:
                 st.error("❌ টোকেন সঠিক নয়।")
@@ -255,11 +273,9 @@ with tab_admin:
     m = meta_get_all()
     st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
 
-    # Schedule
     # ---- Create / Schedule new election (robust) ----
     ename = st.text_input("Election name", value=m.get("name", ""))
 
-    # Use saved schedule if available; else fall back to now / +2h
     def _parse_iso(s: str):
         try:
             return datetime.fromisoformat(s)
@@ -297,13 +313,11 @@ with tab_admin:
     )
 
     if st.button("Set & Schedule"):
-        # --- validation ---
         if end_dt <= start_dt:
             st.error("End time must be **after** start time.")
         elif end_dt <= now_cet():
             st.error("End time is already **in the past**. Pick a future end.")
         else:
-            # Write meta without auto-flip
             meta_set("name", ename)
             meta_set("start_cet", start_dt.isoformat())
             meta_set("end_cet",   end_dt.isoformat())
@@ -312,11 +326,9 @@ with tab_admin:
             st.success("Election scheduled (status = scheduled).")
             st.rerun()
 
-
     c1,c2,c3 = st.columns(3)
     if c1.button("Start Now"):
         start_now = now_cet()
-        # keep current end if valid; otherwise set to +2h
         end_cet_str = meta_get_all().get("end_cet", "")
         try:
             end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
@@ -325,47 +337,38 @@ with tab_admin:
         if not end_kept or end_kept <= start_now:
             end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
+        meta_set("name", ename or m.get("name",""))
         meta_set("start_cet", start_now.isoformat())
         meta_set("end_cet",   end_kept.isoformat())
         meta_set("status",    "ongoing")
         st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
         st.rerun()
 
-
     if c2.button("End Now"):
-        end_now = now_cet()  # CET-aware helper from your code
-        # keep name as-is; just stamp the end and close
+        end_now = now_cet()
         meta_set("end_cet", end_now.isoformat())
         meta_set("status", "ended")
         st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
-        st.rerun()  # important so the header shows 'ended' immediately
+        st.rerun()
 
     if c3.button("Publish Results"):
         meta_set("published","TRUE"); meta_set("status","ended")
         st.success("Results published")
 
-
     st.divider()
     st.markdown("### 🗄️ Archive & Reset for a New Election")
 
     if st.button("Archive votes & reset voters"):
-        # 1) archive votes into a new table
         ts = now_cet().strftime("%Y%m%dT%H%M%S")
         archive_table = f"votes_archive_{ts}"
         cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
         conn.commit()
-
-        # 2) clear current votes
         cur.execute("DELETE FROM votes")
         conn.commit()
-
-        # 3) reset voter usage flags
         cur.execute("UPDATE voters SET used = 0, used_at = ''")
         conn.commit()
-
         st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
         st.rerun()
-
 
     # -------------------- Token generator --------------------
     st.markdown("### 🔑 Generate tokens")
@@ -393,22 +396,65 @@ with tab_admin:
         st.success(f"Voter added. Token: {tok}")
         st.code(tok)
 
-    # -------------------- Candidates --------------------
-    st.markdown("### 📋 Candidates")
-    with st.form("add_candidate"):
-        col1, col2 = st.columns(2)
-        pos = col1.text_input("Position", placeholder="e.g., President")
-        cand = col2.text_input("Candidate", placeholder="e.g., Alice")
-        submitted = st.form_submit_button("Add Candidate")
-    if submitted:
-        if pos.strip() and cand.strip():
-            cur.execute("INSERT INTO candidates (position, candidate) VALUES (?, ?)", (pos.strip(), cand.strip()))
-            conn.commit()
-            st.success(f"Candidate '{cand}' added for position '{pos}'")
-            st.rerun()
-        else:
-            st.error("Please enter both position and candidate name.")
-    st.dataframe(load_candidates_df(), width='stretch')
+    # -------------------- Candidates (CRUD) --------------------
+    st.markdown("### 📋 Candidates (persisted)")
+
+    all_cands = load_candidates_df()
+    all_positions = sorted(all_cands["position"].dropna().astype(str).unique().tolist()) if not all_cands.empty else []
+    colf1, colf2 = st.columns([2, 3])
+    with colf1:
+        pos_filter = st.selectbox("Filter by position (optional)", options=["(all)"] + all_positions, index=0)
+    with colf2:
+        st.caption("Use Edit/Save/Delete for individual rows. Add new entries below.")
+
+    # Add new candidate
+    st.markdown("#### ➕ Add new")
+    cnew1, cnew2, cnew3 = st.columns([2, 2, 1])
+    with cnew1:
+        new_pos = st.text_input("Position", key="new_pos")
+    with cnew2:
+        new_cand = st.text_input("Candidate", key="new_cand")
+    with cnew3:
+        if st.button("Add"):
+            if not new_pos.strip() or not new_cand.strip():
+                st.error("Position এবং Candidate দুটোই দিন।")
+            else:
+                add_candidate(new_pos, new_cand)
+                st.success("Added.")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### ✏️ Edit / 🗑️ Delete")
+
+    # Apply filter
+    view_df = all_cands.copy()
+    if pos_filter != "(all)":
+        view_df = view_df[view_df["position"] == pos_filter]
+
+    if view_df.empty:
+        st.info("No candidates yet for this filter.")
+    else:
+        for _, r in view_df.sort_values(["position", "candidate"]).iterrows():
+            rid = int(r["id"])
+            with st.container(border=True):
+                ec1, ec2, ec3, ec4 = st.columns([2, 2, 1, 1])
+                with ec1:
+                    p_val = st.text_input("Position", value=str(r["position"]), key=f"pos_{rid}")
+                with ec2:
+                    c_val = st.text_input("Candidate", value=str(r["candidate"]), key=f"cand_{rid}")
+                with ec3:
+                    if st.button("Save", key=f"save_{rid}"):
+                        if not p_val.strip() or not c_val.strip():
+                            st.error("Position এবং Candidate ফাঁকা রাখা যাবে না।")
+                        else:
+                            update_candidate(rid, p_val, c_val)
+                            st.success("Saved.")
+                            st.rerun()
+                with ec4:
+                    if st.button("Delete", key=f"del_{rid}"):
+                        delete_candidate(rid)
+                        st.warning("Deleted.")
+                        st.rerun()
 
     # -------------------- Voters (show/hide tokens + export) --------------------
     st.markdown("### 👥 Voters")
@@ -422,7 +468,6 @@ with tab_admin:
             display_df["token"] = "••••••••"
         st.dataframe(display_df[["id","name","email","token","used","used_at"]], width='stretch')
 
-        # Download full tokens CSV (always includes real tokens)
         csv_bytes = voters_df[["id","name","email","token","used","used_at"]].to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download tokens.csv",
