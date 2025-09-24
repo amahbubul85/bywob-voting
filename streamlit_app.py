@@ -168,6 +168,27 @@ def results_df():
     g = df.groupby(["position","candidate"]).size().reset_index(name="votes")
     return g.sort_values(["position","votes"], ascending=[True,False])
 
+# --- Safe token utilities (no dummy inserts) ---
+def token_exists(tok: str, exclude_id: int | None = None) -> bool:
+    tok = (tok or "").strip()
+    if not tok:
+        return False
+    if exclude_id is None:
+        row = cur.execute("SELECT 1 FROM voters WHERE TRIM(token)=TRIM(?) LIMIT 1", (tok,)).fetchone()
+    else:
+        row = cur.execute(
+            "SELECT 1 FROM voters WHERE TRIM(token)=TRIM(?) AND id<>?",
+            (tok, int(exclude_id)),
+        ).fetchone()
+    return row is not None
+
+def create_unique_token(prefix: str) -> str:
+    alpha = string.ascii_uppercase + string.digits
+    while True:
+        tok = prefix + "-" + "".join(secrets.choice(alpha) for _ in range(6))
+        if not token_exists(tok):
+            return tok
+
 
 # ---- extra helpers for CSV + bulk upsert ----
 def get_voter_by_email(email: str):
@@ -485,17 +506,17 @@ with tab_admin:
                         st.warning("Deleted.")
                         st.rerun()
 
-    # -------------------- Voters (inline edit + CSV in-place) --------------------
+
+    # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
     st.markdown("### 👥 Voters")
 
     c_left, c_right = st.columns([3, 2])
     with c_left:
-        show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens for editing/copying.")
-        edit_mode   = st.checkbox("Edit directly in the table", value=False)
+        show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens to edit/copy.")
 
     with c_right:
-        csv_file   = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"])
-        auto_pref  = st.text_input("Auto-token prefix", value="BYWOB-2025")
+        csv_file  = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"])
+        auto_pref = st.text_input("Auto-token prefix", value="BYWOB-2025")
 
         if csv_file is not None:
             try:
@@ -508,106 +529,94 @@ with tab_admin:
                     email_c = cols["email"]
                     token_c = cols.get("token")  # optional
 
-                    # Wipe current voters table completely
+                    # Replace everything
                     cur.execute("DELETE FROM voters")
                     conn.commit()
 
-                    inserted = 0
+                    inserted, seen = 0, set()
                     for _, r in up_df.iterrows():
                         name  = str(r[name_c]).strip()
                         email = str(r[email_c]).strip()
-                        token = str(r[token_c]).strip() if token_c else ""
-                        if not token:
-                            token = generate_tokens(1, auto_pref)[0]
-                            # remove the auto-inserted row from generate_tokens
-                            cur.execute("DELETE FROM voters WHERE token=?", (token,))
-                            conn.commit()
+                        tok   = str(r[token_c]).strip() if token_c else ""
+                        if not tok or tok in seen or token_exists(tok):
+                            tok = create_unique_token(auto_pref)
+                        seen.add(tok)
                         cur.execute(
                             "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-                            (name, email, token, 0, ""),
+                            (name, email, tok, 0, ""),
                         )
                         inserted += 1
 
                     conn.commit()
-                    st.success(f"Imported {inserted} voters (old voters table cleared).")
+                    st.success(f"Imported {inserted} voters (replaced previous list).")
                     st.rerun()
             except Exception as e:
                 st.error(f"CSV read failed: {e}")
 
-
+    # Load & show editor
     voters_df = load_voters_df()
+    cols = ["id","name","email","token","used","used_at"]
+
     if voters_df.empty:
-        st.info("কোনো ভোটার নেই।")
+        df_for_edit = pd.DataFrame(columns=cols)
     else:
-        cols = ["id","name","email","token","used","used_at"]
+        df_for_edit = voters_df[cols].copy()
 
-        # When editing, tokens should be visible so users can change them safely.
-        table_df = voters_df[cols].copy()
-        if not show_tokens:
-            table_df["token"] = "••••••••"
+    # Show masked tokens visually if needed (editor itself uses real values below)
+    display_df = df_for_edit.copy()
+    if not show_tokens and not display_df.empty:
+        display_df["token"] = "••••••••"
 
-        if edit_mode:
-            if not show_tokens:
-                st.info("Tokens are masked. Tick **Show tokens** to edit tokens.")
-            # editable view
-            edited = st.data_editor(
-                voters_df[cols],  # real values for editing
-                key="voters_editor",
-                use_container_width=True,
-                num_rows="dynamic",  # allow adding rows
-                disabled=["id", "used", "used_at"],  # those are managed by the app
-                column_config={
-                    "id": st.column_config.NumberColumn("id", help="Auto-increment primary key"),
-                    "used": st.column_config.NumberColumn("used"),
-                    "used_at": st.column_config.TextColumn("used_at"),
-                },
-            )
-            # Apply button
-            if st.button("💾 Save changes"):
-                try:
-                    # 1) Update existing rows by id
-                    existing_ids = set(int(i) for i in voters_df["id"].tolist())
-                    to_update = edited[edited["id"].notna()].copy()
-                    for _, r in to_update.iterrows():
-                        rid = int(r["id"])
-                        if rid in existing_ids:
-                            cur.execute(
-                                "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
-                                (str(r["name"] or "").strip(),
-                                str(r["email"] or "").strip(),
-                                str(r["token"] or "").strip(),
-                                rid),
-                            )
+    # Always editable table; can add rows at the bottom
+    edited = st.data_editor(
+        df_for_edit,                      # real values so edits persist
+        key="voters_editor",
+        use_container_width=True,
+        num_rows="dynamic",               # <-- enables adding new rows inline
+        disabled=["id","used","used_at"], # system-managed columns
+    )
 
-                    # 2) Insert new rows where id is blank/NaN
-                    to_insert = edited[edited["id"].isna()].copy()
-                    for _, r in to_insert.iterrows():
-                        name  = str(r.get("name","")).strip()
-                        email = str(r.get("email","")).strip()
-                        token = str(r.get("token","")).strip()
-                        if not email and not token and not name:
-                            continue  # skip completely empty rows
-                        if not token:
-                            token = generate_tokens(1, auto_pref)[0]
-                        cur.execute(
-                            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-                            (name, email, token, 0, ""),
-                        )
+    if st.button("💾 Save changes"):
+        try:
+            # Updates: rows with an id
+            to_update = edited[edited["id"].notna()].copy()
+            for _, r in to_update.iterrows():
+                rid   = int(r["id"])
+                name  = str(r.get("name","")).strip()
+                email = str(r.get("email","")).strip()
+                tok   = str(r.get("token","")).strip()
+                if not tok or token_exists(tok, exclude_id=rid):
+                    tok = create_unique_token(auto_pref)
+                cur.execute(
+                    "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
+                    (name, email, tok, rid),
+                )
 
-                    conn.commit()
-                    st.success("Voter table saved.")
-                    st.rerun()
-                except sqlite3.IntegrityError as e:
-                    st.error(f"Save failed (token must be unique): {e}")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
-        else:
-            # read-only view (masked or unmasked)
-            st.dataframe(table_df, use_container_width=True)
+            # Inserts: rows with blank/NaN id (added inline)
+            to_insert = edited[edited["id"].isna()].copy()
+            for _, r in to_insert.iterrows():
+                name  = str(r.get("name","")).strip()
+                email = str(r.get("email","")).strip()
+                tok   = str(r.get("token","")).strip()
+                if not name and not email and not tok:
+                    continue  # skip fully empty lines
+                if not tok or token_exists(tok):
+                    tok = create_unique_token(auto_pref)
+                cur.execute(
+                    "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                    (name, email, tok, 0, ""),
+                )
 
-        # Export (always real tokens)
-        csv_bytes = voters_df[cols].to_csv(index=False).encode("utf-8")
-        st.download_button("Download voters.csv", data=csv_bytes, file_name="voters.csv", mime="text/csv")
+            conn.commit()
+            st.success("Voter table saved.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    # Export (always real tokens)
+    export_df = load_voters_df()
+    csv_bytes = export_df[cols].to_csv(index=False).encode("utf-8")
+    st.download_button("Download voters.csv", data=csv_bytes, file_name="voters.csv", mime="text/csv")
 
     # -------------------- Results --------------------
     st.markdown("### 📈 Results")
