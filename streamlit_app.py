@@ -523,7 +523,23 @@ with st.expander("SMTP settings (not saved)"):
             f"{body.format(election=election_name, name=str(prv['name'] or ''), token=str(prv['token']), sender_name=sender_name)}"
         )
 
+
+
+
+    # -------------------- Token generator --------------------
+    st.markdown("### 🔑 Generate tokens")
+    g1, g2 = st.columns(2)
+    num = g1.number_input("কতটি টোকেন?", min_value=1, value=10)
+    pref = g2.text_input("Prefix", value="BYWOB-2025")
+    if st.button("Generate"):
+        new_tokens = generate_tokens(num, pref)
+        st.success(f"{len(new_tokens)} tokens generated")
+        st.caption("Copy the tokens below:")
+        st.code("\n".join(new_tokens) if new_tokens else "—")
+
+
     # Send button
+    st.markdown("### 🔑 Email voters")
     if st.button("🚀 Send tokens by email to all voters with an email"):
         if not sender_email or not sender_password or not smtp_server or not smtp_port:
             st.error("Please fill SMTP server, port, sender email, and password.")
@@ -565,21 +581,6 @@ with st.expander("SMTP settings (not saved)"):
                         st.write(f"- {em}: {err}")
                     if len(sent_fail) > 10:
                         st.write("...and more.")
-
-
-    # -------------------- Token generator --------------------
-    st.markdown("### 🔑 Generate tokens")
-    g1, g2 = st.columns(2)
-    num = g1.number_input("কতটি টোকেন?", min_value=1, value=10)
-    pref = g2.text_input("Prefix", value="BYWOB-2025")
-    if st.button("Generate"):
-        new_tokens = generate_tokens(num, pref)
-        st.success(f"{len(new_tokens)} tokens generated")
-        st.caption("Copy the tokens below:")
-        st.code("\n".join(new_tokens) if new_tokens else "—")
-
-
-    
 
     # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
     st.markdown("### 📋 Candidates (persisted)")
