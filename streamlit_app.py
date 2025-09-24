@@ -12,6 +12,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+
 def send_token_email_smtp(
     receiver_email: str,
     receiver_name: str,
@@ -24,31 +25,34 @@ def send_token_email_smtp(
     sender_name: str = "Election Admin",
     use_ssl: bool = True,
     subject_template: str = "🗳️ Voting Token for {election}",
-    body_template: str = """Hello {name},
+    body_template: str = """\
+Hello {name},
 
-Your voting token for {election} is:
+You have been registered to vote in **{election}**.
 
+🔑 Your unique voting token is:
+    
     {token}
 
-Please keep it safe.
+Please keep this token safe. It can only be used **once**.
 
-You can vote here: {vote_link}
+➡️ To cast your vote, go to the voting page and enter the token when prompted.
 
-Thank you,
+Thank you,  
 {sender}
 """,
-    vote_link: str = "",
 ):
-    """Send a token email (plain text) via SMTP. Templates support {name}, {token}, {election}, {sender}, {vote_link}."""
+    """Send a token email to a single voter using SMTP."""
 
-    # Format subject and body with all placeholders, including {vote_link}
+    # Format subject and body
     subject = subject_template.format(
-        election=election_name, name=receiver_name, token=token, sender=sender_name, vote_link=vote_link
+        election=election_name, name=receiver_name, token=token, sender=sender_name
     )
     body = body_template.format(
-        election=election_name, name=receiver_name, token=token, sender=sender_name, vote_link=vote_link
+        election=election_name, name=receiver_name, token=token, sender=sender_name
     )
 
+    # Build email
     msg = MIMEMultipart()
     msg["From"] = f"{sender_name} <{sender_email}>"
     msg["To"] = receiver_email
@@ -64,7 +68,6 @@ Thank you,
             server.starttls()
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, receiver_email, msg.as_string())
-
 
 
 
@@ -702,14 +705,17 @@ with tab_admin:
         except Exception as e:
             st.error(f"Save failed: {e}")
 
-
+    # Email to selected voters
 
     # -------------------- Email to selected voters --------------------
-    # Toggle visibility (keeps the form on rerun)
+
+    # Step 1: toggle showing SMTP settings
     if st.button("📧 Send email to selected voters"):
         st.session_state.show_smtp = True
 
+    # Step 2: show the SMTP form if toggled
     if st.session_state.get("show_smtp", False):
+
         selected = edited[edited.get("send_email", False) == True]
         if selected.empty:
             st.warning("No voters selected for email.")
@@ -720,85 +726,45 @@ with tab_admin:
             sender_password = st.text_input("Sender password", type="password", key="sender_password")
             smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
             smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
-
-            # Voting link (this will be injected as {vote_link})
-            vote_link = st.text_input(
-                "Voting link (URL shown in the email)",
-                value=st.session_state.get("vote_link", ""),
-                key="vote_link",
-                placeholder="https://your-streamlit-app-url.streamlit.app/",
-            )
-
-            # Subject/body templates now can include {vote_link}
-            subj = st.text_input("Subject", value="🗳️ Voting Token for {election}", key="smtp_subject")
+            subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
             body = st.text_area(
                 "Body",
-                value=(
-                    "Hello {name},\n\n"
-                    "Your voting token for {election} is:\n\n"
-                    "    {token}\n\n"
-                    "Please keep it safe.\n\n"
-                    "You can vote here: {vote_link}\n\n"
-                    "Thank you,\n"
-                    "{sender}\n"
-                ),
+                value="Hello {name},\n\nYour voting token for {election} is: {token}\n\nRegards,\n{sender}",
                 key="smtp_body",
-                height=200,
             )
             sender_name = "BYWOB Voting"
 
-            # Optional: quickly preview the first selected email
-            with st.expander("Preview first selected email"):
-                try:
-                    r_prev = selected.iloc[0]
-                    st.code(
-                        f"To: {r_prev['email']}\n"
-                        f"Subject: {subj.format(election=meta_get_all().get('name','Election'), name=str(r_prev['name']), token=str(r_prev['token']), sender=sender_name, vote_link=vote_link)}\n\n"
-                        f"{body.format(election=meta_get_all().get('name','Election'), name=str(r_prev['name']), token=str(r_prev['token']), sender=sender_name, vote_link=vote_link)}"
-                    )
-                except Exception:
-                    st.caption("Select at least one voter to preview.")
+            # Actual send button
+            if st.button("🚀 Really send emails", type="primary"):
+                election_name = meta_get_all().get("name", "Election")
+                sent_ok, sent_fail = 0, []
 
-            cols = st.columns([1,1])
-            with cols[0]:
-                if st.button("🚀 Really send emails", type="primary"):
-                    election_name = meta_get_all().get("name", "Election")
-                    sent_ok, sent_fail = 0, []
-                    for _, r in selected.iterrows():
-                        try:
-                            send_token_email_smtp(
-                                receiver_email=str(r["email"]).strip(),
-                                receiver_name=str(r["name"]).strip(),
-                                token=str(r["token"]).strip(),
-                                election_name=election_name,
-                                smtp_server=st.session_state["smtp_server"],
-                                smtp_port=int(st.session_state["smtp_port"]),
-                                sender_email=st.session_state["sender_email"],
-                                sender_password=st.session_state["sender_password"],
-                                sender_name=sender_name,
-                                use_ssl=True,
-                                subject_template=st.session_state["smtp_subject"],
-                                body_template=st.session_state["smtp_body"],
-                                vote_link=st.session_state["vote_link"],
-                            )
-                            sent_ok += 1
-                        except Exception as e:
-                            sent_fail.append((r["email"], str(e)))
+                for _, r in selected.iterrows():
+                    try:
+                        send_token_email_smtp(
+                            receiver_email=str(r["email"]).strip(),
+                            receiver_name=str(r["name"]).strip(),
+                            token=str(r["token"]).strip(),
+                            election_name=election_name,
+                            smtp_server=st.session_state["smtp_server"],
+                            smtp_port=int(st.session_state["smtp_port"]),
+                            sender_email=st.session_state["sender_email"],
+                            sender_password=st.session_state["sender_password"],
+                            sender_name=sender_name,
+                            use_ssl=True,
+                            subject_template=st.session_state["smtp_subject"],
+                            body_template=st.session_state["smtp_body"],
+                        )
+                        sent_ok += 1
+                    except Exception as e:
+                        sent_fail.append((r["email"], str(e)))
 
-                    if sent_ok:
-                        st.success(f"✅ Emails sent to {sent_ok} voter(s).")
-                    if sent_fail:
-                        st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
-                        for em, err in sent_fail[:10]:
-                            st.write(f"- {em}: {err}")
-                        if len(sent_fail) > 10:
-                            st.write("...and more.")
-
-            with cols[1]:
-                if st.button("Hide SMTP Settings"):
-                    st.session_state.show_smtp = False
-                    st.rerun()
-
+                if sent_ok:
+                    st.success(f"✅ Emails sent to {sent_ok} voter(s).")
+                if sent_fail:
+                    st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
+                    for em, err in sent_fail[:10]:
+                        st.write(f"- {em}: {err}")
 
 
 
