@@ -529,23 +529,7 @@ with tab_admin:
         except Exception as e:
             st.error(f"Save failed: {e}")
 
-    # Delete selected
-    if not cand_df.empty:
-        st.divider()
-        st.markdown("#### 🗑️ Delete selected")
-        lab_df = cand_df.copy()
-        lab_df["_label"] = lab_df["position"].astype(str) + " — " + lab_df["candidate"].astype(str)
-        del_ids = st.multiselect(
-            "Choose candidates to delete",
-            options=lab_df["id"].tolist(),
-            format_func=lambda x: lab_df.loc[lab_df["id"] == x, "_label"].values[0],
-        )
-        if st.button("Delete selected"):
-            for rid in del_ids:
-                delete_candidate(int(rid))
-            conn.commit()
-            st.warning(f"Deleted {len(del_ids)} candidate(s).")
-            st.rerun()
+
 
 
 
