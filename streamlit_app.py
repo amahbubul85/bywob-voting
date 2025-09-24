@@ -2,16 +2,16 @@
 # BYWOB Online Voting — Streamlit + SQLite (no Google Sheets quota issues)
 
 import streamlit as st
+import os
 import pandas as pd
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo  # ✅ added for proper CET/CEST handling
 import secrets, string
 
-import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
+import smtplib
 
 def send_token_email_smtp(
     receiver_email: str,
@@ -28,29 +28,25 @@ def send_token_email_smtp(
     body_template: str = """\
 Hello {name},
 
-You have been registered to vote in **{election}**.
+Your voting token for {election} is:
 
-🔑 Your unique voting token is:
-    
     {token}
 
-Please keep this token safe. It can only be used **once**.
+Vote here: {vote_link}
 
-➡️ To cast your vote, go to the voting page and enter the token when prompted.
-
-Thank you,  
+Thank you,
 {sender}
 """,
+    vote_link: str = "",   # ✅ NEW
 ):
-    """Send a token email to a single voter using SMTP."""
-
-    # Format subject and body
     subject = subject_template.format(
-        election=election_name, name=receiver_name, token=token, sender=sender_name
+        election=election_name, name=receiver_name, token=token, sender=sender_name, vote_link=vote_link
     )
     body = body_template.format(
-        election=election_name, name=receiver_name, token=token, sender=sender_name
+        election=election_name, name=receiver_name, token=token, sender=sender_name, vote_link=vote_link
     )
+    ...
+
 
     # Build email
     msg = MIMEMultipart()
@@ -68,6 +64,7 @@ Thank you,
             server.starttls()
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, receiver_email, msg.as_string())
+
 
 
 
@@ -393,6 +390,22 @@ with tab_results:
     r = results_df()
     st.dataframe(r if not r.empty else pd.DataFrame([{"info":"No votes yet"}]), width='stretch')
 
+def get_default_vote_link() -> str:
+    # Prefer a secret or env var so you don’t have to type it every time.
+    # Set one of these in Streamlit Cloud or your environment:
+    #   secrets.toml:  APP_URL = "https://your-app-url.streamlit.app/"
+    #   or env var:    APP_URL=https://your-app-url.streamlit.app/
+    link = ""
+    try:
+        link = st.secrets.get("APP_URL", "")
+    except Exception:
+        pass
+    if not link:
+        link = os.getenv("APP_URL", "")
+    # fallback placeholder
+    return link or "https://your-app-url.streamlit.app/"
+
+
 # ------------------------ Admin Tab ------------------------
 with tab_admin:
     st.subheader("🛠️ Admin Tools")
@@ -707,15 +720,13 @@ with tab_admin:
 
     # Email to selected voters
 
-    # -------------------- Email to selected voters --------------------
 
-    # Step 1: toggle showing SMTP settings
+    # Step 1: button to reveal the SMTP form
     if st.button("📧 Send email to selected voters"):
         st.session_state.show_smtp = True
 
     # Step 2: show the SMTP form if toggled
     if st.session_state.get("show_smtp", False):
-
         selected = edited[edited.get("send_email", False) == True]
         if selected.empty:
             st.warning("No voters selected for email.")
@@ -726,15 +737,24 @@ with tab_admin:
             sender_password = st.text_input("Sender password", type="password", key="sender_password")
             smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
             smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
+
             subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
             body = st.text_area(
                 "Body",
-                value="Hello {name},\n\nYour voting token for {election} is: {token}\n\nRegards,\n{sender}",
+                value="Hello {name},\n\nYour voting token for {election} is: {token}\n\nVote here: {vote_link}\n\nRegards,\n{sender}",
                 key="smtp_body",
             )
+
+            # ✅ NEW: pre-filled vote link (reads from secrets/env via helper)
+            vote_link = st.text_input(
+                "Voting link (URL to your app)",
+                value=st.session_state.get("vote_link", get_default_vote_link()),
+                key="vote_link",
+                help="This is inserted into the email as {vote_link}",
+            )
+
             sender_name = "BYWOB Voting"
 
-            # Actual send button
             if st.button("🚀 Really send emails", type="primary"):
                 election_name = meta_get_all().get("name", "Election")
                 sent_ok, sent_fail = 0, []
@@ -754,6 +774,7 @@ with tab_admin:
                             use_ssl=True,
                             subject_template=st.session_state["smtp_subject"],
                             body_template=st.session_state["smtp_body"],
+                            vote_link=st.session_state["vote_link"],  # ✅ pass it through
                         )
                         sent_ok += 1
                     except Exception as e:
@@ -765,6 +786,8 @@ with tab_admin:
                     st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
                     for em, err in sent_fail[:10]:
                         st.write(f"- {em}: {err}")
+
+
 
 
 
