@@ -639,10 +639,7 @@ with tab_admin:
         except Exception as e:
             st.error(f"Save failed: {e}")
 
-    # Export (always real tokens)
-    export_df = load_voters_df()
-    csv_bytes = export_df[cols].to_csv(index=False).encode("utf-8")
-    st.download_button("Download voters.csv", data=csv_bytes, file_name="voters.csv", mime="text/csv")
+
 
     # -------------------- Results --------------------
     st.markdown("### 📈 Results")
