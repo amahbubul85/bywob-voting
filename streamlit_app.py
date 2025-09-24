@@ -423,20 +423,7 @@ with tab_admin:
         st.caption("Copy the tokens below:")
         st.code("\n".join(new_tokens) if new_tokens else "—")
 
-    # -------------------- Add single voter --------------------
-    st.markdown("### ➕ Add single voter")
-    with st.form("add_single_voter"):
-        sv1, sv2 = st.columns(2)
-        name_in = sv1.text_input("Name")
-        email_in = sv2.text_input("Email")
-        sv3, sv4 = st.columns(2)
-        manual_token = sv3.text_input("Token (optional, leave blank to auto-generate)")
-        auto_prefix = sv4.text_input("Auto prefix (if blank token)", value="BYWOB-2025")
-        add_clicked = st.form_submit_button("Add voter")
-    if add_clicked:
-        tok = add_voter(name_in, email_in, manual_token or None, auto_prefix)
-        st.success(f"Voter added. Token: {tok}")
-        st.code(tok)
+
 
     # -------------------- Candidates (CRUD) --------------------
     st.markdown("### 📋 Candidates (persisted)")
