@@ -706,38 +706,45 @@ with tab_admin:
             st.error(f"Save failed: {e}")
 
     # Email to selected voters
+
     if st.button("📧 Send email to selected voters"):
-        selected = edited[edited["send_email"] == True]
+        selected = edited[edited.get("send_email", False) == True]
         if selected.empty:
             st.warning("No voters selected for email.")
         else:
             st.markdown("#### SMTP Settings")
-            sender_email = st.text_input("Sender email")
-            sender_password = st.text_input("Sender password", type="password")
-            smtp_server = st.text_input("SMTP server", value="smtp.gmail.com")
-            smtp_port = st.number_input("SMTP port", value=465)
-            subj = st.text_input("Subject", value="Your BYWOB Voting Token")
-            body = st.text_area("Body", value="Hello {name}, your token is {token}.")
+
+            sender_email = st.text_input("Sender email", key="sender_email")
+            sender_password = st.text_input("Sender password", type="password", key="sender_password")
+            smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
+            smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
+            subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
+            body = st.text_area(
+                "Body",
+                value="Hello {name},\n\nYour voting token for {election} is: {token}\n\nRegards,\n{sender}",
+                key="smtp_body",
+            )
             sender_name = "BYWOB Voting"
 
             if st.button("🚀 Really send emails", type="primary"):
-                election_name = meta_get_all().get("name","Election")
+                election_name = meta_get_all().get("name", "Election")
                 sent_ok, sent_fail = 0, []
+
                 for _, r in selected.iterrows():
                     try:
                         send_token_email_smtp(
-                            receiver_email=r["email"],
-                            receiver_name=r["name"],
-                            token=r["token"],
+                            receiver_email=str(r["email"]).strip(),
+                            receiver_name=str(r["name"]).strip(),
+                            token=str(r["token"]).strip(),
                             election_name=election_name,
-                            smtp_server=smtp_server,
-                            smtp_port=int(smtp_port),
-                            sender_email=sender_email,
-                            sender_password=sender_password,
+                            smtp_server=st.session_state["smtp_server"],
+                            smtp_port=int(st.session_state["smtp_port"]),
+                            sender_email=st.session_state["sender_email"],
+                            sender_password=st.session_state["sender_password"],
                             sender_name=sender_name,
                             use_ssl=True,
-                            subject_template=subj,
-                            body_template=body,
+                            subject_template=st.session_state["smtp_subject"],
+                            body_template=st.session_state["smtp_body"],
                         )
                         sent_ok += 1
                     except Exception as e:
@@ -747,8 +754,10 @@ with tab_admin:
                     st.success(f"✅ Emails sent to {sent_ok} voter(s).")
                 if sent_fail:
                     st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
-                    for em, err in sent_fail:
+                    for em, err in sent_fail[:10]:
                         st.write(f"- {em}: {err}")
+                    if len(sent_fail) > 10:
+                        st.write("...and more.")
 
 
 
