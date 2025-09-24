@@ -753,77 +753,7 @@ with st.expander("SMTP settings (not saved)"):
     st.download_button("Download voters.csv", data=csv_bytes, file_name="voters.csv", mime="text/csv")
 
 
-    # -------------------- Email voters --------------------
-    st.markdown("### 📧 Email voters")
-
-    with st.expander("SMTP settings (not saved)"):
-        colA, colB = st.columns(2)
-        with colA:
-            smtp_server = st.text_input("SMTP server", value="smtp.gmail.com")
-            smtp_port   = st.number_input("Port", value=465, step=1)
-            use_ssl     = st.radio("Security", options=["SSL", "STARTTLS"], index=0) == "SSL"
-        with colB:
-            sender_email    = st.text_input("Sender email (login)")
-            sender_password = st.text_input("App password / SMTP key", type="password")
-            sender_name     = st.text_input("Sender name", value="Election Committee")
-
-        m = meta_get_all()
-        election_name = st.text_input("Election name (for emails)", value=m.get("name", "BYWOB Election"))
-
-        subj = st.text_input("Subject", value="Your voting token for {election}")
-        body = st.text_area(
-            "Body",
-            value=(
-                "Dear {name},\n\n"
-                "Here is your secure voting token for {election}:\n\n"
-                "    {token}\n\n"
-                "Regards,\n{sender_name}"
-            ),
-            height=160,
-        )
-
-    # Send button
-    if st.button("🚀 Send tokens by email to all voters with an email"):
-        if not sender_email or not sender_password or not smtp_server or not smtp_port:
-            st.error("Please fill SMTP server, port, sender email, and password.")
-        else:
-            voters = load_voters_df()
-            if voters.empty:
-                st.warning("No voters found.")
-            else:
-                sent_ok, sent_fail = 0, []
-                for _, r in voters.iterrows():
-                    email = str(r.get("email","")).strip()
-                    token = str(r.get("token","")).strip()
-                    name  = str(r.get("name","")).strip()
-                    if not email:
-                        continue
-                    try:
-                        send_token_email_smtp(
-                            receiver_email=email,
-                            receiver_name=name,
-                            token=token,
-                            election_name=election_name,
-                            smtp_server=smtp_server,
-                            smtp_port=int(smtp_port),
-                            sender_email=sender_email,
-                            sender_password=sender_password,
-                            sender_name=sender_name,
-                            use_ssl=use_ssl,
-                            subject_template=subj,
-                            body_template=body,
-                        )
-                        sent_ok += 1
-                    except Exception as e:
-                        sent_fail.append((email, str(e)))
-                if sent_ok:
-                    st.success(f"Emails sent to {sent_ok} voter(s).")
-                if sent_fail:
-                    st.error(f"Failed for {len(sent_fail)}:")
-                    for em, err in sent_fail[:10]:
-                        st.write(f"- {em}: {err}")
-                    if len(sent_fail) > 10:
-                        st.write("...and more.")
+    
 
     # -------------------- Results --------------------
     st.markdown("### 📈 Results")
