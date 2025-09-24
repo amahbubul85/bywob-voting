@@ -8,6 +8,69 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo  # ✅ added for proper CET/CEST handling
 import secrets, string
 
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+def send_token_email_smtp(
+    receiver_email: str,
+    receiver_name: str,
+    token: str,
+    election_name: str,
+    smtp_server: str,
+    smtp_port: int,
+    sender_email: str,
+    sender_password: str,
+    sender_name: str = "Election Admin",
+    use_ssl: bool = True,
+    subject_template: str = "🗳️ Voting Token for {election}",
+    body_template: str = """\
+Hello {name},
+
+You have been registered to vote in **{election}**.
+
+🔑 Your unique voting token is:
+    
+    {token}
+
+Please keep this token safe. It can only be used **once**.
+
+➡️ To cast your vote, go to the voting page and enter the token when prompted.
+
+Thank you,  
+{sender}
+""",
+):
+    """Send a token email to a single voter using SMTP."""
+
+    # Format subject and body
+    subject = subject_template.format(
+        election=election_name, name=receiver_name, token=token, sender=sender_name
+    )
+    body = body_template.format(
+        election=election_name, name=receiver_name, token=token, sender=sender_name
+    )
+
+    # Build email
+    msg = MIMEMultipart()
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["To"] = receiver_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+
+
+
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
@@ -534,6 +597,7 @@ with tab_admin:
 
 
     # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
+
     st.markdown("### 👥 Voters")
 
     c_left, c_right = st.columns([3, 2])
@@ -588,23 +652,26 @@ with tab_admin:
     else:
         df_for_edit = voters_df[cols].copy()
 
-    # Show masked tokens visually if needed (editor itself uses real values below)
+    # Add checkbox column for selecting voters to email
+    df_for_edit["send_email"] = False
+
+    # Mask tokens visually if needed
     display_df = df_for_edit.copy()
     if not show_tokens and not display_df.empty:
         display_df["token"] = "••••••••"
 
-    # Always editable table; can add rows at the bottom
+    # Editable voter table
     edited = st.data_editor(
-        df_for_edit,                      # real values so edits persist
+        df_for_edit,
         key="voters_editor",
         use_container_width=True,
-        num_rows="dynamic",               # <-- enables adding new rows inline
-        disabled=["id","used","used_at"], # system-managed columns
+        num_rows="dynamic",               # add rows inline
+        disabled=["id","used","used_at"], # system-managed
     )
 
+    # Save changes (update + insert)
     if st.button("💾 Save changes"):
         try:
-            # Updates: rows with an id
             to_update = edited[edited["id"].notna()].copy()
             for _, r in to_update.iterrows():
                 rid   = int(r["id"])
@@ -618,14 +685,13 @@ with tab_admin:
                     (name, email, tok, rid),
                 )
 
-            # Inserts: rows with blank/NaN id (added inline)
             to_insert = edited[edited["id"].isna()].copy()
             for _, r in to_insert.iterrows():
                 name  = str(r.get("name","")).strip()
                 email = str(r.get("email","")).strip()
                 tok   = str(r.get("token","")).strip()
                 if not name and not email and not tok:
-                    continue  # skip fully empty lines
+                    continue
                 if not tok or token_exists(tok):
                     tok = create_unique_token(auto_pref)
                 cur.execute(
@@ -638,6 +704,52 @@ with tab_admin:
             st.rerun()
         except Exception as e:
             st.error(f"Save failed: {e}")
+
+    # Email to selected voters
+    if st.button("📧 Send email to selected voters"):
+        selected = edited[edited["send_email"] == True]
+        if selected.empty:
+            st.warning("No voters selected for email.")
+        else:
+            st.markdown("#### SMTP Settings")
+            sender_email = st.text_input("Sender email")
+            sender_password = st.text_input("Sender password", type="password")
+            smtp_server = st.text_input("SMTP server", value="smtp.gmail.com")
+            smtp_port = st.number_input("SMTP port", value=465)
+            subj = st.text_input("Subject", value="Your BYWOB Voting Token")
+            body = st.text_area("Body", value="Hello {name}, your token is {token}.")
+            sender_name = "BYWOB Voting"
+
+            if st.button("🚀 Really send emails", type="primary"):
+                election_name = meta_get_all().get("name","Election")
+                sent_ok, sent_fail = 0, []
+                for _, r in selected.iterrows():
+                    try:
+                        send_token_email_smtp(
+                            receiver_email=r["email"],
+                            receiver_name=r["name"],
+                            token=r["token"],
+                            election_name=election_name,
+                            smtp_server=smtp_server,
+                            smtp_port=int(smtp_port),
+                            sender_email=sender_email,
+                            sender_password=sender_password,
+                            sender_name=sender_name,
+                            use_ssl=True,
+                            subject_template=subj,
+                            body_template=body,
+                        )
+                        sent_ok += 1
+                    except Exception as e:
+                        sent_fail.append((r["email"], str(e)))
+
+                if sent_ok:
+                    st.success(f"✅ Emails sent to {sent_ok} voter(s).")
+                if sent_fail:
+                    st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
+                    for em, err in sent_fail:
+                        st.write(f"- {em}: {err}")
+
 
 
 
