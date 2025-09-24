@@ -7,6 +7,10 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo  # ✅ added for proper CET/CEST handling
 import secrets, string
+import smtplib, ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 st.title("🗳️ BYWOB Online Voting")
@@ -88,6 +92,50 @@ def is_voting_open() -> bool:
         meta_set("status","ended")
         return False
     return True
+
+# -------------------- Email helper --------------------
+def send_token_email_smtp(
+    receiver_email: str,
+    receiver_name: str,
+    token: str,
+    election_name: str,
+    smtp_server: str,
+    smtp_port: int,
+    sender_email: str,
+    sender_password: str,
+    sender_name: str = "",
+    use_ssl: bool = True,
+    subject_template: str = "Your voting token for {election}",
+    body_template: str = (
+        "Dear {name},\n\n"
+        "Here is your secure voting token for {election}:\n\n"
+        "    {token}\n\n"
+        "Use this token to cast your vote during the election period.\n\n"
+        "Regards,\n{sender_name}"
+    ),
+):
+    subject = subject_template.format(election=election_name, name=receiver_name, token=token)
+    body = body_template.format(
+        election=election_name, name=receiver_name, token=token, sender_name=sender_name or sender_email
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{sender_name} <{sender_email}>" if sender_name else sender_email
+    msg["To"] = receiver_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    context = ssl.create_default_context()
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls(context=context)
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+
 
 # --------------------------------------------------------------------------------------
 # Loaders
@@ -433,6 +481,92 @@ with tab_admin:
         st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
         st.rerun()
 
+    st.divider()
+st.markdown("### 📧 Email voters their tokens")
+
+with st.expander("SMTP settings (not saved)"):
+    colA, colB = st.columns(2)
+    with colA:
+        smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", help="Gmail: smtp.gmail.com")
+        smtp_port   = st.number_input("Port", value=465, step=1, help="SSL: 465, STARTTLS: 587")
+        use_ssl     = st.radio("Security", options=["SSL (recommended)", "STARTTLS"], horizontal=True) == "SSL (recommended)"
+    with colB:
+        sender_email    = st.text_input("Sender email (login)")
+        sender_password = st.text_input("App password / SMTP key", type="password", help="For Gmail, use an App Password")
+        sender_name     = st.text_input("Sender display name", value="Election Committee")
+
+    m = meta_get_all()
+    election_name = st.text_input("Election name (for emails)", value=m.get("name", "BYWOB Election"))
+
+    st.caption("Subject/body support {name}, {token}, {election}, {sender_name}")
+    subj = st.text_input("Subject", value="Your voting token for {election}")
+    body = st.text_area(
+        "Body",
+        value=(
+            "Dear {name},\n\n"
+            "Here is your secure voting token for {election}:\n\n"
+            "    {token}\n\n"
+            "Use this token to cast your vote during the election period.\n\n"
+            "Regards,\n{sender_name}"
+        ),
+        height=160,
+    )
+
+    # Optional preview on the first voter
+    voters_preview = load_voters_df()
+    if not voters_preview.empty:
+        prv = voters_preview.iloc[0]
+        st.markdown("**Preview:**")
+        st.code(
+            f"To: {prv['email']}\n"
+            f"Subject: {subj.format(election=election_name, name=str(prv['name'] or ''), token=str(prv['token']))}\n\n"
+            f"{body.format(election=election_name, name=str(prv['name'] or ''), token=str(prv['token']), sender_name=sender_name)}"
+        )
+
+    # Send button
+    if st.button("🚀 Send tokens by email to all voters with an email"):
+        if not sender_email or not sender_password or not smtp_server or not smtp_port:
+            st.error("Please fill SMTP server, port, sender email, and password.")
+        else:
+            voters = load_voters_df()
+            if voters.empty:
+                st.warning("No voters found.")
+            else:
+                sent_ok, sent_fail = 0, []
+                for _, r in voters.iterrows():
+                    email = str(r.get("email","")).strip()
+                    token = str(r.get("token","")).strip()
+                    name  = str(r.get("name","")).strip()
+                    if not email:
+                        continue
+                    try:
+                        send_token_email_smtp(
+                            receiver_email=email,
+                            receiver_name=name,
+                            token=token,
+                            election_name=election_name,
+                            smtp_server=smtp_server,
+                            smtp_port=int(smtp_port),
+                            sender_email=sender_email,
+                            sender_password=sender_password,
+                            sender_name=sender_name,
+                            use_ssl=use_ssl,
+                            subject_template=subj,
+                            body_template=body,
+                        )
+                        sent_ok += 1
+                    except Exception as e:
+                        sent_fail.append((email, str(e)))
+                if sent_ok:
+                    st.success(f"Emails sent to {sent_ok} voter(s).")
+                if sent_fail:
+                    st.error(f"Failed for {len(sent_fail)}:")
+                    for em, err in sent_fail[:10]:
+                        st.write(f"- {em}: {err}")
+                    if len(sent_fail) > 10:
+                        st.write("...and more.")
+
+
     # -------------------- Token generator --------------------
     st.markdown("### 🔑 Generate tokens")
     g1, g2 = st.columns(2)
@@ -445,7 +579,7 @@ with tab_admin:
         st.code("\n".join(new_tokens) if new_tokens else "—")
 
 
-
+    
 
     # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
     st.markdown("### 📋 Candidates (persisted)")
