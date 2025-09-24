@@ -707,7 +707,15 @@ with tab_admin:
 
     # Email to selected voters
 
+    # -------------------- Email to selected voters --------------------
+
+    # Step 1: toggle showing SMTP settings
     if st.button("📧 Send email to selected voters"):
+        st.session_state.show_smtp = True
+
+    # Step 2: show the SMTP form if toggled
+    if st.session_state.get("show_smtp", False):
+
         selected = edited[edited.get("send_email", False) == True]
         if selected.empty:
             st.warning("No voters selected for email.")
@@ -726,6 +734,7 @@ with tab_admin:
             )
             sender_name = "BYWOB Voting"
 
+            # Actual send button
             if st.button("🚀 Really send emails", type="primary"):
                 election_name = meta_get_all().get("name", "Election")
                 sent_ok, sent_fail = 0, []
@@ -756,8 +765,7 @@ with tab_admin:
                     st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
                     for em, err in sent_fail[:10]:
                         st.write(f"- {em}: {err}")
-                    if len(sent_fail) > 10:
-                        st.write("...and more.")
+
 
 
 
