@@ -446,65 +446,107 @@ with tab_admin:
 
 
 
-    # -------------------- Candidates (CRUD) --------------------
+
+    # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
     st.markdown("### 📋 Candidates (persisted)")
 
-    all_cands = load_candidates_df()
-    all_positions = sorted(all_cands["position"].dropna().astype(str).unique().tolist()) if not all_cands.empty else []
-    colf1, colf2 = st.columns([2, 3])
-    with colf1:
-        pos_filter = st.selectbox("Filter by position (optional)", options=["(all)"] + all_positions, index=0)
-    with colf2:
-        st.caption("Use Edit/Save/Delete for individual rows. Add new entries below.")
+    cl, cr = st.columns([3, 2])
 
-    # Add new candidate
-    st.markdown("#### ➕ Add new")
-    cnew1, cnew2, cnew3 = st.columns([2, 2, 1])
-    with cnew1:
-        new_pos = st.text_input("Position", key="new_pos")
-    with cnew2:
-        new_cand = st.text_input("Candidate", key="new_cand")
-    with cnew3:
-        if st.button("Add"):
-            if not new_pos.strip() or not new_cand.strip():
-                st.error("Position এবং Candidate দুটোই দিন।")
-            else:
-                add_candidate(new_pos, new_cand)
-                st.success("Added.")
-                st.rerun()
+    with cr:
+        cand_csv = st.file_uploader("Upload Candidates CSV (position,candidate)", type=["csv"])
+        if cand_csv is not None:
+            try:
+                cdf = pd.read_csv(cand_csv).fillna("")
+                cols = {c.lower().strip(): c for c in cdf.columns}
+                if "position" not in cols or "candidate" not in cols:
+                    st.error("CSV must contain at least: position, candidate")
+                else:
+                    pcol, ccol = cols["position"], cols["candidate"]
 
-    st.divider()
-    st.markdown("#### ✏️ Edit / 🗑️ Delete")
+                    # Clean + dedupe
+                    imp = cdf[[pcol, ccol]].copy()
+                    imp[pcol] = imp[pcol].astype(str).str.strip()
+                    imp[ccol] = imp[ccol].astype(str).str.strip()
+                    imp = imp[(imp[pcol] != "") & (imp[ccol] != "")]
+                    imp = imp.drop_duplicates([pcol, ccol], keep="last")
 
-    # Apply filter
-    view_df = all_cands.copy()
-    if pos_filter != "(all)":
-        view_df = view_df[view_df["position"] == pos_filter]
+                    # ✅ REPLACE: wipe and insert fresh
+                    cur.execute("DELETE FROM candidates")
+                    conn.commit()
 
-    if view_df.empty:
-        st.info("No candidates yet for this filter.")
-    else:
-        for _, r in view_df.sort_values(["position", "candidate"]).iterrows():
-            rid = int(r["id"])
-            with st.container(border=True):
-                ec1, ec2, ec3, ec4 = st.columns([2, 2, 1, 1])
-                with ec1:
-                    p_val = st.text_input("Position", value=str(r["position"]), key=f"pos_{rid}")
-                with ec2:
-                    c_val = st.text_input("Candidate", value=str(r["candidate"]), key=f"cand_{rid}")
-                with ec3:
-                    if st.button("Save", key=f"save_{rid}"):
-                        if not p_val.strip() or not c_val.strip():
-                            st.error("Position এবং Candidate ফাঁকা রাখা যাবে না।")
-                        else:
-                            update_candidate(rid, p_val, c_val)
-                            st.success("Saved.")
-                            st.rerun()
-                with ec4:
-                    if st.button("Delete", key=f"del_{rid}"):
-                        delete_candidate(rid)
-                        st.warning("Deleted.")
-                        st.rerun()
+                    for _, r in imp.iterrows():
+                        cur.execute(
+                            "INSERT OR IGNORE INTO candidates (position, candidate) VALUES (?, ?)",
+                            (r[pcol], r[ccol]),
+                        )
+                    conn.commit()
+                    st.success(f"Imported {len(imp)} candidates (replaced previous list).")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"CSV read failed: {e}")
+
+    # Load for inline editor
+    cand_df = load_candidates_df()
+    c_cols = ["id", "position", "candidate"]
+    edit_df = cand_df[c_cols].copy() if not cand_df.empty else pd.DataFrame(columns=c_cols)
+
+    st.caption("Add new rows at the bottom. Leave **id** blank for new candidates.")
+    c_edited = st.data_editor(
+        edit_df,
+        key="candidates_editor",
+        use_container_width=True,
+        num_rows="dynamic",   # <-- add rows inline
+        disabled=["id"],      # id is auto PK
+    )
+
+    # Save changes (updates + inserts)
+    if st.button("💾 Save candidate changes"):
+        try:
+            # updates: rows with id
+            to_update = c_edited[c_edited["id"].notna()].copy()
+            for _, r in to_update.iterrows():
+                rid = int(r["id"])
+                pos = str(r.get("position", "")).strip()
+                can = str(r.get("candidate", "")).strip()
+                if pos and can:
+                    update_candidate(rid, pos, can)
+
+            # inserts: rows without id
+            to_insert = c_edited[c_edited["id"].isna()].copy()
+            inserted = 0
+            for _, r in to_insert.iterrows():
+                pos = str(r.get("position", "")).strip()
+                can = str(r.get("candidate", "")).strip()
+                if not pos and not can:
+                    continue  # ignore empty line
+                if pos and can:
+                    add_candidate(pos, can)
+                    inserted += 1
+
+            conn.commit()
+            st.success(f"Saved. {len(to_update)} updated, {inserted} added.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    # Delete selected
+    if not cand_df.empty:
+        st.divider()
+        st.markdown("#### 🗑️ Delete selected")
+        lab_df = cand_df.copy()
+        lab_df["_label"] = lab_df["position"].astype(str) + " — " + lab_df["candidate"].astype(str)
+        del_ids = st.multiselect(
+            "Choose candidates to delete",
+            options=lab_df["id"].tolist(),
+            format_func=lambda x: lab_df.loc[lab_df["id"] == x, "_label"].values[0],
+        )
+        if st.button("Delete selected"):
+            for rid in del_ids:
+                delete_candidate(int(rid))
+            conn.commit()
+            st.warning(f"Deleted {len(del_ids)} candidate(s).")
+            st.rerun()
+
 
 
     # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
