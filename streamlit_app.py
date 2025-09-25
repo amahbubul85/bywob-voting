@@ -88,19 +88,33 @@ if "show_smtp" not in st.session_state:
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
 
-# --- Admin auth ---
+# --- Admin auth helper ---
 def is_admin() -> bool:
-    # keep session once unlocked
+    # Already unlocked this session?
     if st.session_state.get("is_admin", False):
         return True
 
-    # Use a PIN from Streamlit secrets (set in .streamlit/secrets.toml)
-    correct_pin = st.secrets.get("ADMIN_PIN", "")
-    pin = st.sidebar.text_input("Admin PIN", type="password", help="Admins only")
-    if correct_pin and pin == correct_pin:
-        st.session_state.is_admin = True
-        st.sidebar.success("Admin mode enabled")
-        return True
+    pin_in_secrets = st.secrets.get("ADMIN_PIN", "")  # set this in secrets.toml or Streamlit Cloud
+
+    with st.sidebar:
+        st.markdown("### Admin login")
+        pin = st.text_input("Admin PIN", type="password", key="admin_pin")
+        if st.button("Unlock", key="unlock_admin"):
+            if pin_in_secrets and pin == pin_in_secrets:
+                st.session_state.is_admin = True
+                st.success("Admin mode enabled")
+                return True
+            else:
+                st.error("Wrong PIN")
+
+        # Dev fallback: allow admin if no secret set (useful locally)
+        if not pin_in_secrets:
+            st.info("No ADMIN_PIN found in secrets — dev mode.")
+            if st.checkbox("Enable admin (dev)", key="dev_admin"):
+                st.session_state.is_admin = True
+                st.success("Admin mode enabled (dev)")
+                return True
+
     return False
 
 
