@@ -53,8 +53,14 @@ Thank you,
         election=election_name, name=receiver_name, token=token, sender=sender_name
     )
     body = body_template.format(
-        election=election_name, name=receiver_name, token=token, sender=sender_name
+        election=election_name,
+        name=receiver_name,
+        token=token,
+        sender=sender_name,
+        link=link,  # ✅ pass it
     )
+
+
 
     # Build email
     msg = MIMEMultipart()
@@ -136,11 +142,17 @@ def meta_set(k: str, v: str):
 
 m0 = meta_get_all()
 defaults = {
-    "status":"idle",  # idle | scheduled | ongoing | ended | published
-    "name":"", "start_cet":"", "end_cet":"", "published":"FALSE"
+    "status": "idle",  # idle | scheduled | ongoing | ended | published
+    "name": "",
+    "start_cet": "",
+    "end_cet": "",
+    "published": "FALSE",
+    "voting_link": "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/",
 }
-for k,v in defaults.items():
-    if k not in m0: meta_set(k,v)
+for k, v in defaults.items():
+    if k not in m0:
+        meta_set(k, v)
+
 
 def is_voting_open() -> bool:
     m = meta_get_all()
@@ -156,11 +168,7 @@ def is_voting_open() -> bool:
         return False
     return True
 
-defaults = {
-    "status":"idle",  # idle | scheduled | ongoing | ended | published
-    "name":"", "start_cet":"", "end_cet":"", "published":"FALSE",
-    "voting_link": "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/"
-}
+
 
 # --------------------------------------------------------------------------------------
 # Loaders
