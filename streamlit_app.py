@@ -82,8 +82,27 @@ Thank you,
 
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
+if "show_smtp" not in st.session_state:
+    st.session_state.show_smtp = False
+
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
+
+# --- Admin auth ---
+def is_admin() -> bool:
+    # keep session once unlocked
+    if st.session_state.get("is_admin", False):
+        return True
+
+    # Use a PIN from Streamlit secrets (set in .streamlit/secrets.toml)
+    correct_pin = st.secrets.get("ADMIN_PIN", "")
+    pin = st.sidebar.text_input("Admin PIN", type="password", help="Admins only")
+    if correct_pin and pin == correct_pin:
+        st.session_state.is_admin = True
+        st.sidebar.success("Admin mode enabled")
+        return True
+    return False
+
 
 # --------------------------------------------------------------------------------------
 # CET Timezone
@@ -332,15 +351,28 @@ def delete_voter(row_id: int):
 # --------------------------------------------------------------------------------------
 # UI Tabs
 # --------------------------------------------------------------------------------------
-tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "🔑 Admin"])
+ADMIN = is_admin()
+if ADMIN:
+    tab_vote, tab_results, tab_admin = st.tabs(["🗳️ Vote", "📊 Results", "🔑 Admin"])
+else:
+    tab_vote, = st.tabs(["🗳️ Vote"])
+
 
 # ------------------------ Vote Tab ------------------------
 with tab_vote:
     if "ballot" not in st.session_state:
         st.session_state.ballot = {"ready": False}
 
-    if is_voting_open() and not st.session_state.ballot["ready"]:
-        st.markdown('<meta http-equiv="refresh" content="30">', unsafe_allow_html=True)
+    # Only auto-refresh for non-admin users to avoid wiping Admin inputs
+    if (not st.session_state.get("is_admin", False)) and is_voting_open() and not st.session_state.ballot["ready"]:
+        # Prefer a server-side rerun (keeps session) instead of full page reload:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=30_000, key="vote_autorefresh")
+        except Exception:
+            # If you don't want to add a dependency, just disable auto-refresh for admins
+            pass
+
 
     st.subheader("ভোট দিন (টোকেন ব্যবহার করে)")
 
@@ -406,402 +438,423 @@ with tab_vote:
                 st.rerun()
 
 # ------------------------ Results Tab ------------------------
-with tab_results:
-    st.subheader("📊 Live Results")
-    r = results_df()
-    st.dataframe(r if not r.empty else pd.DataFrame([{"info":"No votes yet"}]), width='stretch')
+if ADMIN:
+    with tab_results:
+        st.subheader("📊 Live Results")
+        r = results_df()
+        st.dataframe(r if not r.empty else pd.DataFrame([{"info":"No votes yet"}]), width='stretch')
 
 # ------------------------ Admin Tab ------------------------
-with tab_admin:
-    st.subheader("🛠️ Admin Tools")
-    m = meta_get_all()
-    st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
+if ADMIN:
+    with tab_admin:
+        st.subheader("🛠️ Admin Tools")
+        m = meta_get_all()
+        st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
 
-    # ---- Create / Schedule new election (robust) ----
-    ename = st.text_input("Election name", value=m.get("name", ""))
+        # ---- Create / Schedule new election (robust) ----
+        ename = st.text_input("Election name", value=m.get("name", ""))
 
-    def _parse_iso(s: str):
-        try:
-            return datetime.fromisoformat(s)
-        except Exception:
-            return None
+        def _parse_iso(s: str):
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
 
-    _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
-    _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
+        _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
+        _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Start Time (CET)**")
-        sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
-        stm = st.time_input(
-            "Start time",
-            value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
-            key="start_time",
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Start Time (CET)**")
+            sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
+            stm = st.time_input(
+                "Start time",
+                value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
+                key="start_time",
+            )
+        with col2:
+            st.markdown("**End Time (CET)**")
+            edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
+            etm = st.time_input(
+                "End time",
+                value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
+                key="end_time",
+            )
+
+        start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
+        end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
+
+        st.info(
+            f"**সময়সূচী (CET):**\n"
+            f"- শুরু: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
+            f"- শেষ:  {end_dt.strftime('%Y-%m-%d %H:%M')}"
         )
-    with col2:
-        st.markdown("**End Time (CET)**")
-        edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
-        etm = st.time_input(
-            "End time",
-            value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
-            key="end_time",
-        )
 
-    start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
-    end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
+        if st.button("Set & Schedule"):
+            if end_dt <= start_dt:
+                st.error("End time must be **after** start time.")
+            elif end_dt <= now_cet():
+                st.error("End time is already **in the past**. Pick a future end.")
+            else:
+                meta_set("name", ename)
+                meta_set("start_cet", start_dt.isoformat())
+                meta_set("end_cet",   end_dt.isoformat())
+                meta_set("status",    "scheduled")
+                meta_set("published", "FALSE")
+                st.success("Election scheduled (status = scheduled).")
+                st.rerun()
 
-    st.info(
-        f"**সময়সূচী (CET):**\n"
-        f"- শুরু: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
-        f"- শেষ:  {end_dt.strftime('%Y-%m-%d %H:%M')}"
-    )
+        c1,c2,c3 = st.columns(3)
+        if c1.button("Start Now"):
+            start_now = now_cet()
+            end_cet_str = meta_get_all().get("end_cet", "")
+            try:
+                end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
+            except Exception:
+                end_kept = None
+            if not end_kept or end_kept <= start_now:
+                end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
-    if st.button("Set & Schedule"):
-        if end_dt <= start_dt:
-            st.error("End time must be **after** start time.")
-        elif end_dt <= now_cet():
-            st.error("End time is already **in the past**. Pick a future end.")
-        else:
-            meta_set("name", ename)
-            meta_set("start_cet", start_dt.isoformat())
-            meta_set("end_cet",   end_dt.isoformat())
-            meta_set("status",    "scheduled")
-            meta_set("published", "FALSE")
-            st.success("Election scheduled (status = scheduled).")
+            meta_set("name", ename or m.get("name",""))
+            meta_set("start_cet", start_now.isoformat())
+            meta_set("end_cet",   end_kept.isoformat())
+            meta_set("status",    "ongoing")
+            st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
             st.rerun()
 
-    c1,c2,c3 = st.columns(3)
-    if c1.button("Start Now"):
-        start_now = now_cet()
-        end_cet_str = meta_get_all().get("end_cet", "")
-        try:
-            end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
-        except Exception:
-            end_kept = None
-        if not end_kept or end_kept <= start_now:
-            end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
+        if c2.button("End Now"):
+            end_now = now_cet()
+            meta_set("end_cet", end_now.isoformat())
+            meta_set("status", "ended")
+            st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
+            st.rerun()
 
-        meta_set("name", ename or m.get("name",""))
-        meta_set("start_cet", start_now.isoformat())
-        meta_set("end_cet",   end_kept.isoformat())
-        meta_set("status",    "ongoing")
-        st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
-        st.rerun()
+        if c3.button("Publish Results"):
+            meta_set("published","TRUE"); meta_set("status","ended")
+            st.success("Results published")
 
-    if c2.button("End Now"):
-        end_now = now_cet()
-        meta_set("end_cet", end_now.isoformat())
-        meta_set("status", "ended")
-        st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
-        st.rerun()
+        st.divider()
+        st.markdown("### 🗄️ Archive & Reset for a New Election")
 
-    if c3.button("Publish Results"):
-        meta_set("published","TRUE"); meta_set("status","ended")
-        st.success("Results published")
-
-    st.divider()
-    st.markdown("### 🗄️ Archive & Reset for a New Election")
-
-    if st.button("Archive votes & reset voters"):
-        ts = now_cet().strftime("%Y%m%dT%H%M%S")
-        archive_table = f"votes_archive_{ts}"
-        cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
-        conn.commit()
-        cur.execute("DELETE FROM votes")
-        conn.commit()
-        cur.execute("UPDATE voters SET used = 0, used_at = ''")
-        conn.commit()
-        st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
-        st.rerun()
-
-    # -------------------- Token generator --------------------
-    st.markdown("### 🔑 Generate tokens")
-    g1, g2 = st.columns(2)
-    num = g1.number_input("কতটি টোকেন?", min_value=1, value=10)
-    pref = g2.text_input("Prefix", value="BYWOB-2025")
-    if st.button("Generate"):
-        new_tokens = generate_tokens(num, pref)
-        st.success(f"{len(new_tokens)} tokens generated")
-        st.caption("Copy the tokens below:")
-        st.code("\n".join(new_tokens) if new_tokens else "—")
-
-
-
-
-    # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
-    st.markdown("### 📋 Candidates (persisted)")
-
-    cl, cr = st.columns([3, 2])
-
-    with cr:
-        cand_csv = st.file_uploader("Upload Candidates CSV (position,candidate)", type=["csv"])
-        if cand_csv is not None:
-            try:
-                cdf = pd.read_csv(cand_csv).fillna("")
-                cols = {c.lower().strip(): c for c in cdf.columns}
-                if "position" not in cols or "candidate" not in cols:
-                    st.error("CSV must contain at least: position, candidate")
-                else:
-                    pcol, ccol = cols["position"], cols["candidate"]
-
-                    # Clean + dedupe
-                    imp = cdf[[pcol, ccol]].copy()
-                    imp[pcol] = imp[pcol].astype(str).str.strip()
-                    imp[ccol] = imp[ccol].astype(str).str.strip()
-                    imp = imp[(imp[pcol] != "") & (imp[ccol] != "")]
-                    imp = imp.drop_duplicates([pcol, ccol], keep="last")
-
-                    # ✅ REPLACE: wipe and insert fresh
-                    cur.execute("DELETE FROM candidates")
-                    conn.commit()
-
-                    for _, r in imp.iterrows():
-                        cur.execute(
-                            "INSERT OR IGNORE INTO candidates (position, candidate) VALUES (?, ?)",
-                            (r[pcol], r[ccol]),
-                        )
-                    conn.commit()
-                    st.success(f"Imported {len(imp)} candidates (replaced previous list).")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"CSV read failed: {e}")
-
-    # Load for inline editor
-    cand_df = load_candidates_df()
-    c_cols = ["id", "position", "candidate"]
-    edit_df = cand_df[c_cols].copy() if not cand_df.empty else pd.DataFrame(columns=c_cols)
-
-    st.caption("Add new rows at the bottom. Leave **id** blank for new candidates.")
-    c_edited = st.data_editor(
-        edit_df,
-        key="candidates_editor",
-        use_container_width=True,
-        num_rows="dynamic",   # <-- add rows inline
-        disabled=["id"],      # id is auto PK
-    )
-
-    # Save changes (updates + inserts)
-    if st.button("💾 Save candidate changes"):
-        try:
-            # updates: rows with id
-            to_update = c_edited[c_edited["id"].notna()].copy()
-            for _, r in to_update.iterrows():
-                rid = int(r["id"])
-                pos = str(r.get("position", "")).strip()
-                can = str(r.get("candidate", "")).strip()
-                if pos and can:
-                    update_candidate(rid, pos, can)
-
-            # inserts: rows without id
-            to_insert = c_edited[c_edited["id"].isna()].copy()
-            inserted = 0
-            for _, r in to_insert.iterrows():
-                pos = str(r.get("position", "")).strip()
-                can = str(r.get("candidate", "")).strip()
-                if not pos and not can:
-                    continue  # ignore empty line
-                if pos and can:
-                    add_candidate(pos, can)
-                    inserted += 1
-
+        if st.button("Archive votes & reset voters"):
+            ts = now_cet().strftime("%Y%m%dT%H%M%S")
+            archive_table = f"votes_archive_{ts}"
+            cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
             conn.commit()
-            st.success(f"Saved. {len(to_update)} updated, {inserted} added.")
+            cur.execute("DELETE FROM votes")
+            conn.commit()
+            cur.execute("UPDATE voters SET used = 0, used_at = ''")
+            conn.commit()
+            st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Save failed: {e}")
+
+        # -------------------- Token generator --------------------
+        st.markdown("### 🔑 Generate tokens")
+        g1, g2 = st.columns(2)
+        num = g1.number_input("কতটি টোকেন?", min_value=1, value=10)
+        pref = g2.text_input("Prefix", value="BYWOB-2025")
+        if st.button("Generate"):
+            new_tokens = generate_tokens(num, pref)
+            st.success(f"{len(new_tokens)} tokens generated")
+            st.caption("Copy the tokens below:")
+            st.code("\n".join(new_tokens) if new_tokens else "—")
 
 
 
 
+        # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
+        st.markdown("### 📋 Candidates (persisted)")
 
-    # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
+        cl, cr = st.columns([3, 2])
 
-    st.markdown("### 👥 Voters")
+        with cr:
+            cand_csv = st.file_uploader("Upload Candidates CSV (position,candidate)", type=["csv"])
+            if cand_csv is not None:
+                try:
+                    cdf = pd.read_csv(cand_csv).fillna("")
+                    cols = {c.lower().strip(): c for c in cdf.columns}
+                    if "position" not in cols or "candidate" not in cols:
+                        st.error("CSV must contain at least: position, candidate")
+                    else:
+                        pcol, ccol = cols["position"], cols["candidate"]
 
-    c_left, c_right = st.columns([3, 2])
-    with c_left:
-        show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens to edit/copy.")
+                        # Clean + dedupe
+                        imp = cdf[[pcol, ccol]].copy()
+                        imp[pcol] = imp[pcol].astype(str).str.strip()
+                        imp[ccol] = imp[ccol].astype(str).str.strip()
+                        imp = imp[(imp[pcol] != "") & (imp[ccol] != "")]
+                        imp = imp.drop_duplicates([pcol, ccol], keep="last")
 
-    with c_right:
-        csv_file  = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"])
-        auto_pref = st.text_input("Auto-token prefix", value="BYWOB-2025")
+                        # ✅ REPLACE: wipe and insert fresh
+                        cur.execute("DELETE FROM candidates")
+                        conn.commit()
 
-        if csv_file is not None:
+                        for _, r in imp.iterrows():
+                            cur.execute(
+                                "INSERT OR IGNORE INTO candidates (position, candidate) VALUES (?, ?)",
+                                (r[pcol], r[ccol]),
+                            )
+                        conn.commit()
+                        st.success(f"Imported {len(imp)} candidates (replaced previous list).")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"CSV read failed: {e}")
+
+        # Load for inline editor
+        cand_df = load_candidates_df()
+        c_cols = ["id", "position", "candidate"]
+        edit_df = cand_df[c_cols].copy() if not cand_df.empty else pd.DataFrame(columns=c_cols)
+
+        st.caption("Add new rows at the bottom. Leave **id** blank for new candidates.")
+        c_edited = st.data_editor(
+            edit_df,
+            key="candidates_editor",
+            use_container_width=True,
+            num_rows="dynamic",   # <-- add rows inline
+            disabled=["id"],      # id is auto PK
+        )
+
+        # Save changes (updates + inserts)
+        if st.button("💾 Save candidate changes"):
             try:
-                up_df = pd.read_csv(csv_file).fillna("")
-                cols = {c.lower().strip(): c for c in up_df.columns}
-                if "name" not in cols or "email" not in cols:
-                    st.error("CSV must contain at least: name, email")
-                else:
-                    name_c  = cols["name"]
-                    email_c = cols["email"]
-                    token_c = cols.get("token")  # optional
+                # updates: rows with id
+                to_update = c_edited[c_edited["id"].notna()].copy()
+                for _, r in to_update.iterrows():
+                    rid = int(r["id"])
+                    pos = str(r.get("position", "")).strip()
+                    can = str(r.get("candidate", "")).strip()
+                    if pos and can:
+                        update_candidate(rid, pos, can)
 
-                    # Replace everything
-                    cur.execute("DELETE FROM voters")
-                    conn.commit()
-
-                    inserted, seen = 0, set()
-                    for _, r in up_df.iterrows():
-                        name  = str(r[name_c]).strip()
-                        email = str(r[email_c]).strip()
-                        tok   = str(r[token_c]).strip() if token_c else ""
-                        if not tok or tok in seen or token_exists(tok):
-                            tok = create_unique_token(auto_pref)
-                        seen.add(tok)
-                        cur.execute(
-                            "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-                            (name, email, tok, 0, ""),
-                        )
+                # inserts: rows without id
+                to_insert = c_edited[c_edited["id"].isna()].copy()
+                inserted = 0
+                for _, r in to_insert.iterrows():
+                    pos = str(r.get("position", "")).strip()
+                    can = str(r.get("candidate", "")).strip()
+                    if not pos and not can:
+                        continue  # ignore empty line
+                    if pos and can:
+                        add_candidate(pos, can)
                         inserted += 1
 
-                    conn.commit()
-                    st.success(f"Imported {inserted} voters (replaced previous list).")
-                    st.rerun()
+                conn.commit()
+                st.success(f"Saved. {len(to_update)} updated, {inserted} added.")
+                st.rerun()
             except Exception as e:
-                st.error(f"CSV read failed: {e}")
+                st.error(f"Save failed: {e}")
 
-    # Load & show editor
-    voters_df = load_voters_df()
-    cols = ["id","name","email","token","used","used_at"]
 
-    if voters_df.empty:
-        df_for_edit = pd.DataFrame(columns=cols)
-    else:
-        df_for_edit = voters_df[cols].copy()
 
-    # Add checkbox column for selecting voters to email
-    df_for_edit["send_email"] = False
 
-    # Mask tokens visually if needed
-    display_df = df_for_edit.copy()
-    if not show_tokens and not display_df.empty:
-        display_df["token"] = "••••••••"
 
-    # Editable voter table
-    edited = st.data_editor(
-        df_for_edit,
-        key="voters_editor",
-        use_container_width=True,
-        num_rows="dynamic",               # add rows inline
-        disabled=["id","used","used_at"], # system-managed
-    )
+        # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
 
-    # Save changes (update + insert)
-    if st.button("💾 Save changes"):
-        try:
-            to_update = edited[edited["id"].notna()].copy()
-            for _, r in to_update.iterrows():
-                rid   = int(r["id"])
-                name  = str(r.get("name","")).strip()
-                email = str(r.get("email","")).strip()
-                tok   = str(r.get("token","")).strip()
-                if not tok or token_exists(tok, exclude_id=rid):
-                    tok = create_unique_token(auto_pref)
-                cur.execute(
-                    "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
-                    (name, email, tok, rid),
-                )
+        st.markdown("### 👥 Voters")
 
-            to_insert = edited[edited["id"].isna()].copy()
-            for _, r in to_insert.iterrows():
-                name  = str(r.get("name","")).strip()
-                email = str(r.get("email","")).strip()
-                tok   = str(r.get("token","")).strip()
-                if not name and not email and not tok:
-                    continue
-                if not tok or token_exists(tok):
-                    tok = create_unique_token(auto_pref)
-                cur.execute(
-                    "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
-                    (name, email, tok, 0, ""),
-                )
+        c_left, c_right = st.columns([3, 2])
+        with c_left:
+            show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens to edit/copy.")
 
-            conn.commit()
-            st.success("Voter table saved.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Save failed: {e}")
+        with c_right:
+            csv_file  = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"])
+            auto_pref = st.text_input("Auto-token prefix", value="BYWOB-2025")
 
-    # Email to selected voters
+            if csv_file is not None:
+                try:
+                    up_df = pd.read_csv(csv_file).fillna("")
+                    cols = {c.lower().strip(): c for c in up_df.columns}
+                    if "name" not in cols or "email" not in cols:
+                        st.error("CSV must contain at least: name, email")
+                    else:
+                        name_c  = cols["name"]
+                        email_c = cols["email"]
+                        token_c = cols.get("token")  # optional
 
-    # -------------------- Email to selected voters --------------------
+                        # Replace everything
+                        cur.execute("DELETE FROM voters")
+                        conn.commit()
 
-    # Step 1: toggle showing SMTP settings
-    if st.button("📧 Send email to selected voters"):
-        st.session_state.show_smtp = True
+                        inserted, seen = 0, set()
+                        for _, r in up_df.iterrows():
+                            name  = str(r[name_c]).strip()
+                            email = str(r[email_c]).strip()
+                            tok   = str(r[token_c]).strip() if token_c else ""
+                            if not tok or tok in seen or token_exists(tok):
+                                tok = create_unique_token(auto_pref)
+                            seen.add(tok)
+                            cur.execute(
+                                "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                                (name, email, tok, 0, ""),
+                            )
+                            inserted += 1
 
-    # Step 2: show the SMTP form if toggled
-    if st.session_state.get("show_smtp", False):
+                        conn.commit()
+                        st.success(f"Imported {inserted} voters (replaced previous list).")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"CSV read failed: {e}")
 
-        selected = edited[edited.get("send_email", False) == True]
-        if selected.empty:
-            st.warning("No voters selected for email.")
+        # Load & show editor
+        voters_df = load_voters_df()
+        cols = ["id","name","email","token","used","used_at"]
+
+        if voters_df.empty:
+            df_for_edit = pd.DataFrame(columns=cols)
         else:
-            st.markdown("#### SMTP Settings")
+            df_for_edit = voters_df[cols].copy()
 
-            sender_email = st.text_input("Sender email", key="sender_email")
-            sender_password = st.text_input("Sender password", type="password", key="sender_password")
-            smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
-            smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
-            subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
-            m2 = meta_get_all()
-            voting_link = st.text_input(
-                "Voting page link",
-                value=m2.get("voting_link", "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/"),
-                help="This link will be inserted into {link} in the email body."
-            )
+        # Add checkbox column for selecting voters to email
+        df_for_edit["send_email"] = False
 
-            body = st.text_area(
-                "Body",
-                value=(
-                    "Hello {name},\n\n"
-                    "Your voting token for {election} is: {token}\n\n"
-                    "Voting link: {link}\n\n"
-                    "Regards,\n{sender}"
-                ),
-                key="smtp_body",
-            )
+        # Mask tokens visually if needed
+        display_df = df_for_edit.copy()
+        if not show_tokens and not display_df.empty:
+            display_df["token"] = "••••••••"
 
-            sender_name = "BYWOB Voting"
+        # Editable voter table
+        edited = st.data_editor(
+            df_for_edit,
+            key="voters_editor",
+            use_container_width=True,
+            num_rows="dynamic",               # add rows inline
+            disabled=["id","used","used_at"], # system-managed
+        )
 
-            # Actual send button
-            if st.button("🚀 Really send emails", type="primary"):
-                election_name = meta_get_all().get("name", "Election")
-                sent_ok, sent_fail = 0, []
+        # Save changes (update + insert)
+        if st.button("💾 Save changes"):
+            try:
+                to_update = edited[edited["id"].notna()].copy()
+                for _, r in to_update.iterrows():
+                    rid   = int(r["id"])
+                    name  = str(r.get("name","")).strip()
+                    email = str(r.get("email","")).strip()
+                    tok   = str(r.get("token","")).strip()
+                    if not tok or token_exists(tok, exclude_id=rid):
+                        tok = create_unique_token(auto_pref)
+                    cur.execute(
+                        "UPDATE voters SET name=?, email=?, token=? WHERE id=?",
+                        (name, email, tok, rid),
+                    )
 
-                for _, r in selected.iterrows():
-                    try:
-                        send_token_email_smtp(
-                            receiver_email=str(r["email"]).strip(),
-                            receiver_name=str(r["name"]).strip(),
-                            token=str(r["token"]).strip(),
-                            election_name=election_name,
-                            link=voting_link,
-                            smtp_server=st.session_state["smtp_server"],
-                            smtp_port=int(st.session_state["smtp_port"]),
-                            sender_email=st.session_state["sender_email"],
-                            sender_password=st.session_state["sender_password"],
-                            sender_name=sender_name,
-                            use_ssl=True,
-                            subject_template=st.session_state["smtp_subject"],
-                            body_template=st.session_state["smtp_body"],
-                        )
-                        sent_ok += 1
-                    except Exception as e:
-                        sent_fail.append((r["email"], str(e)))
+                to_insert = edited[edited["id"].isna()].copy()
+                for _, r in to_insert.iterrows():
+                    name  = str(r.get("name","")).strip()
+                    email = str(r.get("email","")).strip()
+                    tok   = str(r.get("token","")).strip()
+                    if not name and not email and not tok:
+                        continue
+                    if not tok or token_exists(tok):
+                        tok = create_unique_token(auto_pref)
+                    cur.execute(
+                        "INSERT INTO voters (name,email,token,used,used_at) VALUES (?,?,?,?,?)",
+                        (name, email, tok, 0, ""),
+                    )
 
-                if sent_ok:
-                    st.success(f"✅ Emails sent to {sent_ok} voter(s).")
-                if sent_fail:
-                    st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
-                    for em, err in sent_fail[:10]:
-                        st.write(f"- {em}: {err}")
+                conn.commit()
+                st.success("Voter table saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
+        # Email to selected voters
+
+        # -------------------- Email to selected voters --------------------
+
+        # Step 1: toggle showing SMTP settings
+        if st.button("📧 Send email to selected voters"):
+            st.session_state.show_smtp = True
+
+        # Step 2: show the SMTP form if toggled
+        if st.session_state.get("show_smtp", False):
+
+            selected = edited[edited.get("send_email", False) == True]
+            if selected.empty:
+                st.warning("No voters selected for email.")
+            else:
+                st.markdown("#### SMTP Settings")
+
+                sender_email = st.text_input("Sender email", key="sender_email")
+                sender_password = st.text_input("Sender password", type="password", key="sender_password")
+                smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
+                smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
+                subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
+                m2 = meta_get_all()
+                voting_link = st.text_input(
+                    "Voting page link",
+                    value=m2.get("voting_link", "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/"),
+                    help="This link will be inserted into {link} in the email body."
+                )
+
+                body = st.text_area(
+                    "Body",
+                    value=(
+                        "Hello {name},\n\n"
+                        "Your voting token for {election} is: {token}\n\n"
+                        "Voting link: {link}\n\n"
+                        "Regards,\n{sender}"
+                    ),
+                    key="smtp_body",
+                )
+
+                sender_name = "BYWOB Voting"
+
+                # Actual send button
+                if st.button("🚀 Really send emails", type="primary"):
+                    election_name = meta_get_all().get("name", "Election")
+                    sent_ok, sent_fail = 0, []
+
+                    for _, r in selected.iterrows():
+                        try:
+                            send_token_email_smtp(
+                                receiver_email=str(r["email"]).strip(),
+                                receiver_name=str(r["name"]).strip(),
+                                token=str(r["token"]).strip(),
+                                election_name=election_name,
+                                link=voting_link,
+                                smtp_server=st.session_state["smtp_server"],
+                                smtp_port=int(st.session_state["smtp_port"]),
+                                sender_email=st.session_state["sender_email"],
+                                sender_password=st.session_state["sender_password"],
+                                sender_name=sender_name,
+                                use_ssl=True,
+                                subject_template=st.session_state["smtp_subject"],
+                                body_template=st.session_state["smtp_body"],
+                            )
+                            sent_ok += 1
+                        except Exception as e:
+                            sent_fail.append((r["email"], str(e)))
+
+                    if sent_ok:
+                        st.success(f"✅ Emails sent to {sent_ok} voter(s).")
+                    if sent_fail:
+                        st.error(f"❌ Failed for {len(sent_fail)} voter(s).")
+                        for em, err in sent_fail[:10]:
+                            st.write(f"- {em}: {err}")
 
 
 
 
 
-    # -------------------- Results --------------------
-    st.markdown("### 📈 Results")
-    st.dataframe(results_df(), width='stretch')
+        # -------------------- Results --------------------
+        st.markdown("### 📈 Results")
+        st.dataframe(results_df(), width='stretch')
+
+        # -------------------- Backup/Export --------------------
+        st.markdown("### 💾 Backup / Export")
+
+        if st.button("⬇️ Export backup (CSV)"):
+            voters = load_voters_df()
+            cands  = load_candidates_df()
+            votes  = load_votes_df()
+
+            voters.to_csv("voters.csv", index=False)
+            cands.to_csv("candidates.csv", index=False)
+            votes.to_csv("votes.csv", index=False)
+
+            with open("voters.csv","rb") as f:
+                st.download_button("Download voters.csv", f, "voters.csv")
+            with open("candidates.csv","rb") as f:
+                st.download_button("Download candidates.csv", f, "candidates.csv")
+            with open("votes.csv","rb") as f:
+                st.download_button("Download votes.csv", f, "votes.csv")
