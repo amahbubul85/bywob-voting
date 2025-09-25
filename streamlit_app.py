@@ -18,6 +18,7 @@ def send_token_email_smtp(
     receiver_name: str,
     token: str,
     election_name: str,
+    link: str,
     smtp_server: str,
     smtp_port: int,
     sender_email: str,
@@ -36,11 +37,14 @@ You have been registered to vote in **{election}**.
 
 Please keep this token safe. It can only be used **once**.
 
-➡️ To cast your vote, go to the voting page and enter the token when prompted.
+➡️ To cast your vote, use this link:
+{link}
+and enter your token when prompted.
 
 Thank you,  
 {sender}
 """,
+
 ):
     """Send a token email to a single voter using SMTP."""
 
@@ -151,6 +155,12 @@ def is_voting_open() -> bool:
         meta_set("status","ended")
         return False
     return True
+
+defaults = {
+    "status":"idle",  # idle | scheduled | ongoing | ended | published
+    "name":"", "start_cet":"", "end_cet":"", "published":"FALSE",
+    "voting_link": "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/"
+}
 
 # --------------------------------------------------------------------------------------
 # Loaders
@@ -727,11 +737,24 @@ with tab_admin:
             smtp_server = st.text_input("SMTP server", value="smtp.gmail.com", key="smtp_server")
             smtp_port = st.number_input("SMTP port", value=465, step=1, key="smtp_port")
             subj = st.text_input("Subject", value="Your BYWOB Voting Token", key="smtp_subject")
+            m2 = meta_get_all()
+            voting_link = st.text_input(
+                "Voting page link",
+                value=m2.get("voting_link", "https://bywob-voting-umvsdkvtrpa8hf7u95drv9.streamlit.app/"),
+                help="This link will be inserted into {link} in the email body."
+            )
+
             body = st.text_area(
                 "Body",
-                value="Hello {name},\n\nYour voting token for {election} is: {token}\n\nRegards,\n{sender}",
+                value=(
+                    "Hello {name},\n\n"
+                    "Your voting token for {election} is: {token}\n\n"
+                    "Voting link: {link}\n\n"
+                    "Regards,\n{sender}"
+                ),
                 key="smtp_body",
             )
+
             sender_name = "BYWOB Voting"
 
             # Actual send button
@@ -746,6 +769,7 @@ with tab_admin:
                             receiver_name=str(r["name"]).strip(),
                             token=str(r["token"]).strip(),
                             election_name=election_name,
+                            link=voting_link,
                             smtp_server=st.session_state["smtp_server"],
                             smtp_port=int(st.session_state["smtp_port"]),
                             sender_email=st.session_state["sender_email"],
