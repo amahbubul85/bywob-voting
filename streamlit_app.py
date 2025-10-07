@@ -1046,14 +1046,6 @@ if ADMIN:
                         for em, err in sent_fail[:10]:
                             st.write(f"- {em}: {err}")
 
-
-
-
-
-        # -------------------- Results --------------------
-        st.markdown("### 📈 Results")
-        st.dataframe(results_df(), width='stretch')
-
         # -------------------- Backup/Export --------------------
         st.markdown("### 💾 Backup / Export")
 
