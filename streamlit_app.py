@@ -23,6 +23,7 @@ def send_token_email_smtp(
     smtp_port: int,
     sender_email: str,
     sender_password: str,
+    end_time_cet: str,  # ✅ NEW: added end time parameter
     sender_name: str = "Election Admin",
     use_ssl: bool = True,
     subject_template: str = "🗳️ Voting Token for {election}",
@@ -41,6 +42,8 @@ Please keep this token safe. It can only be used **once**.
 {link}
 and enter your token when prompted.
 
+⏰ **Voting ends at: {end_time} CET**
+
 Thank you,  
 {sender}
 """,
@@ -57,7 +60,8 @@ Thank you,
         name=receiver_name,
         token=token,
         sender=sender_name,
-        link=link,  # ✅ pass it
+        link=link,
+        end_time=end_time_cet,  # ✅ NEW: include end time in email
     )
 
 
@@ -201,6 +205,23 @@ def is_voting_open() -> bool:
         return False
     return True
 
+# ✅ NEW: Check if voting can be started (candidates and voters not empty)
+def can_start_voting() -> bool:
+    voters_count = cur.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+    candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+    return voters_count > 0 and candidates_count > 0
+
+# ✅ NEW: Get formatted end time for email
+def get_formatted_end_time() -> str:
+    m = meta_get_all()
+    end_cet = m.get("end_cet", "")
+    if end_cet:
+        try:
+            end_dt = datetime.fromisoformat(end_cet)
+            return end_dt.strftime("%Y-%m-%d %H:%M CET")
+        except:
+            return "Not specified"
+    return "Not specified"
 
 
 # --------------------------------------------------------------------------------------
@@ -464,6 +485,15 @@ if ADMIN:
         st.subheader("🛠️ Admin Tools")
         m = meta_get_all()
         st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
+        
+        # ✅ NEW: Show counts for candidates and voters
+        voters_count = cur.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
+        candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+        st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count}")
+        
+        # ✅ NEW: Warning if cannot start voting
+        if not can_start_voting():
+            st.warning("⚠️ **Cannot start voting:** Need at least 1 candidate and 1 voter")
 
         # ---- Create / Schedule new election (robust) ----
         ename = st.text_input("Election name", value=m.get("name", ""))
@@ -520,6 +550,11 @@ if ADMIN:
 
         c1,c2,c3 = st.columns(3)
         if c1.button("Start Now"):
+            # ✅ NEW: Check if we can start voting
+            if not can_start_voting():
+                st.error("❌ Cannot start voting: Need at least 1 candidate and 1 voter")
+                st.stop()
+                
             start_now = now_cet()
             end_cet_str = meta_get_all().get("end_cet", "")
             try:
@@ -573,8 +608,31 @@ if ADMIN:
             st.caption("Copy the tokens below:")
             st.code("\n".join(new_tokens) if new_tokens else "—")
 
-
-
+        # ✅ NEW: Show candidates and voters during voting
+        if is_voting_open():
+            st.markdown("---")
+            st.markdown("### 📋 Current Candidates & Voters (During Voting)")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("#### Candidates")
+                cands_df = load_candidates_df()
+                if not cands_df.empty:
+                    st.dataframe(cands_df[["position", "candidate"]], hide_index=True)
+                else:
+                    st.info("No candidates added yet")
+            
+            with col2:
+                st.markdown("#### Voters")
+                voters_df = load_voters_df()
+                if not voters_df.empty:
+                    # Show only name and email (hide tokens during voting)
+                    display_voters = voters_df[["name", "email", "used"]].copy()
+                    display_voters["used"] = display_voters["used"].map({0: "No", 1: "Yes"})
+                    st.dataframe(display_voters, hide_index=True)
+                else:
+                    st.info("No voters added yet")
 
         # -------------------- Candidates (CSV replace + inline add/edit/delete) --------------------
         st.markdown("### 📋 Candidates (persisted)")
@@ -806,6 +864,7 @@ if ADMIN:
                         "Hello {name},\n\n"
                         "Your voting token for {election} is: {token}\n\n"
                         "Voting link: {link}\n\n"
+                        "⏰ **Voting ends at: {end_time} CET**\n\n"  # ✅ NEW: Added end time placeholder
                         "Regards,\n{sender}"
                     ),
                     key="smtp_body",
@@ -816,6 +875,7 @@ if ADMIN:
                 # Actual send button
                 if st.button("🚀 Really send emails", type="primary"):
                     election_name = meta_get_all().get("name", "Election")
+                    end_time_formatted = get_formatted_end_time()  # ✅ NEW: Get formatted end time
                     sent_ok, sent_fail = 0, []
 
                     for _, r in selected.iterrows():
@@ -831,6 +891,7 @@ if ADMIN:
                                 sender_email=st.session_state["sender_email"],
                                 sender_password=st.session_state["sender_password"],
                                 sender_name=sender_name,
+                                end_time_cet=end_time_formatted,  # ✅ NEW: Pass end time to email function
                                 use_ssl=True,
                                 subject_template=st.session_state["smtp_subject"],
                                 body_template=st.session_state["smtp_body"],
