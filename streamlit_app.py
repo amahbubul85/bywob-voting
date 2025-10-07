@@ -28,13 +28,9 @@ def send_token_email_smtp(
     use_ssl: bool = True,
     subject_template: str = "🗳️ Voting Token for {election}",
     body_template: str = """\
-Hello {name},
+Hello Sir/Madam,
 
-You have been registered to vote in **{election}**.
-
-🔑 Your unique voting token is:
-    
-    {token}
+Your voting token is: {token}
 
 Please keep this token safe. It can only be used **once**.
 
@@ -42,7 +38,7 @@ Please keep this token safe. It can only be used **once**.
 {link}
 and enter your token when prompted.
 
-⏰ **Voting ends at: {end_time} CET**
+⏰ **Voting ends at: {end_time}**
 
 Thank you,  
 {sender}
@@ -88,6 +84,10 @@ Thank you,
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 if "show_smtp" not in st.session_state:
     st.session_state.show_smtp = False
+
+# ✅ NEW: Track if archive has been done for new election
+if "archive_done" not in st.session_state:
+    st.session_state.archive_done = False
 
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
@@ -211,17 +211,103 @@ def can_start_voting() -> bool:
     candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
     return voters_count > 0 and candidates_count > 0
 
-# ✅ NEW: Get formatted end time for email
+# ✅ NEW: Get formatted end time for email (remove duplicate CET)
 def get_formatted_end_time() -> str:
     m = meta_get_all()
     end_cet = m.get("end_cet", "")
     if end_cet:
         try:
             end_dt = datetime.fromisoformat(end_cet)
-            return end_dt.strftime("%Y-%m-%d %H:%M CET")
+            return end_dt.strftime("%Y-%m-%d %H:%M CET")  # ✅ Only one CET
         except:
             return "Not specified"
     return "Not specified"
+
+# ✅ NEW: Check if there are any votes in the current election
+def has_votes() -> bool:
+    count = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+    return count > 0
+
+# ✅ NEW: Function to archive and reset
+def archive_and_reset():
+    ts = now_cet().strftime("%Y%m%dT%H%M%S")
+    archive_table = f"votes_archive_{ts}"
+    cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
+    conn.commit()
+    cur.execute("DELETE FROM votes")
+    conn.commit()
+    cur.execute("UPDATE voters SET used = 0, used_at = ''")
+    conn.commit()
+    st.session_state.archive_done = True
+    return archive_table
+
+# ✅ NEW: Get winners for each position
+def get_winners():
+    """Returns a DataFrame with winners for each position"""
+    votes_df = load_votes_df()
+    if votes_df.empty:
+        return pd.DataFrame(columns=["Position", "Winner", "Votes", "Status"])
+    
+    # Calculate votes per candidate per position
+    results = votes_df.groupby(["position", "candidate"]).size().reset_index(name="votes")
+    
+    # Find winner for each position (candidate with max votes)
+    winners = []
+    positions = results["position"].unique()
+    
+    for position in positions:
+        pos_results = results[results["position"] == position]
+        max_votes = pos_results["votes"].max()
+        winners_df = pos_results[pos_results["votes"] == max_votes]
+        
+        if len(winners_df) == 1:
+            # Clear winner
+            winner = winners_df.iloc[0]
+            winners.append({
+                "Position": position,
+                "Winner": winner["candidate"],
+                "Votes": winner["votes"],
+                "Status": "🏆 Winner"
+            })
+        else:
+            # Tie situation
+            tied_candidates = ", ".join(winners_df["candidate"].tolist())
+            winners.append({
+                "Position": position,
+                "Winner": tied_candidates,
+                "Votes": max_votes,
+                "Status": "🤝 Tie"
+            })
+    
+    return pd.DataFrame(winners)
+
+# ✅ NEW: Get detailed results for each position
+def get_detailed_results():
+    """Returns detailed results for all positions"""
+    votes_df = load_votes_df()
+    if votes_df.empty:
+        return pd.DataFrame(columns=["Position", "Candidate", "Votes", "Percentage"])
+    
+    results = votes_df.groupby(["position", "candidate"]).size().reset_index(name="votes")
+    
+    # Calculate percentages for each position
+    detailed_results = []
+    positions = results["position"].unique()
+    
+    for position in positions:
+        pos_results = results[results["position"] == position]
+        total_votes = pos_results["votes"].sum()
+        
+        for _, row in pos_results.iterrows():
+            percentage = (row["votes"] / total_votes) * 100 if total_votes > 0 else 0
+            detailed_results.append({
+                "Position": position,
+                "Candidate": row["candidate"],
+                "Votes": row["votes"],
+                "Percentage": f"{percentage:.1f}%"
+            })
+    
+    return pd.DataFrame(detailed_results)
 
 
 # --------------------------------------------------------------------------------------
@@ -476,8 +562,46 @@ with tab_vote:
 if ADMIN:
     with tab_results:
         st.subheader("📊 Live Results")
-        r = results_df()
-        st.dataframe(r if not r.empty else pd.DataFrame([{"info":"No votes yet"}]), width='stretch')
+        
+        m = meta_get_all()
+        status = m.get("status", "idle")
+        
+        # ✅ NEW: Show winners when voting has ended
+        if status in ["ended", "published"]:
+            st.markdown("### 🏆 Election Winners")
+            
+            winners_df = get_winners()
+            if not winners_df.empty:
+                # Display winners in a nice format
+                for _, winner in winners_df.iterrows():
+                    if winner["Status"] == "🏆 Winner":
+                        st.success(f"**{winner['Position']}**: {winner['Winner']} ({winner['Votes']} votes)")
+                    else:
+                        st.warning(f"**{winner['Position']}**: {winner['Winner']} - TIE ({winner['Votes']} votes each)")
+                
+                st.divider()
+                
+                # Show detailed results
+                st.markdown("### 📈 Detailed Results")
+                detailed_results = get_detailed_results()
+                if not detailed_results.empty:
+                    st.dataframe(detailed_results, use_container_width=True)
+                else:
+                    st.info("No detailed results available")
+            else:
+                st.info("No winners to display - no votes were cast")
+        
+        # Show live results during voting
+        elif status == "ongoing":
+            st.markdown("### 📊 Live Voting Results")
+            r = results_df()
+            if not r.empty:
+                st.dataframe(r, use_container_width=True)
+            else:
+                st.info("No votes cast yet")
+        
+        else:
+            st.info("Election has not started yet")
 
 # ------------------------ Admin Tab ------------------------
 if ADMIN:
@@ -489,12 +613,17 @@ if ADMIN:
         # ✅ NEW: Show counts for candidates and voters
         voters_count = cur.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
         candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-        st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count}")
+        votes_count = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count} | **Votes Cast:** {votes_count}")
         
         # ✅ NEW: Warning if cannot start voting
         if not can_start_voting():
             st.warning("⚠️ **Cannot start voting:** Need at least 1 candidate and 1 voter")
 
+        # ✅ NEW: Check if archive is required for new election
+        if has_votes() and m.get("status") in ["ended", "published"] and not st.session_state.archive_done:
+            st.error("🚨 **Archive Required:** You must archive votes and reset voters before starting a new election!")
+        
         # ---- Create / Schedule new election (robust) ----
         ename = st.text_input("Election name", value=m.get("name", ""))
 
@@ -535,6 +664,11 @@ if ADMIN:
         )
 
         if st.button("Set & Schedule"):
+            # ✅ NEW: Check if archive is required
+            if has_votes() and not st.session_state.archive_done:
+                st.error("❌ You must archive votes and reset voters before scheduling a new election!")
+                st.stop()
+                
             if end_dt <= start_dt:
                 st.error("End time must be **after** start time.")
             elif end_dt <= now_cet():
@@ -550,6 +684,11 @@ if ADMIN:
 
         c1,c2,c3 = st.columns(3)
         if c1.button("Start Now"):
+            # ✅ NEW: Check if archive is required
+            if has_votes() and not st.session_state.archive_done:
+                st.error("❌ You must archive votes and reset voters before starting a new election!")
+                st.stop()
+                
             # ✅ NEW: Check if we can start voting
             if not can_start_voting():
                 st.error("❌ Cannot start voting: Need at least 1 candidate and 1 voter")
@@ -579,22 +718,22 @@ if ADMIN:
             st.rerun()
 
         if c3.button("Publish Results"):
-            meta_set("published","TRUE"); meta_set("status","ended")
-            st.success("Results published")
+            meta_set("published","TRUE")
+            meta_set("status","ended")
+            st.success("Results published and winners are now visible!")
+            st.rerun()
 
         st.divider()
         st.markdown("### 🗄️ Archive & Reset for a New Election")
 
-        if st.button("Archive votes & reset voters"):
-            ts = now_cet().strftime("%Y%m%dT%H%M%S")
-            archive_table = f"votes_archive_{ts}"
-            cur.execute(f"CREATE TABLE IF NOT EXISTS {archive_table} AS SELECT * FROM votes")
-            conn.commit()
-            cur.execute("DELETE FROM votes")
-            conn.commit()
-            cur.execute("UPDATE voters SET used = 0, used_at = ''")
-            conn.commit()
-            st.success(f"Archived current votes to table: {archive_table} and reset tokens.")
+        # ✅ NEW: Force archive before new election
+        if has_votes():
+            st.warning("🔒 **Archive Required:** You must archive current votes before starting a new election.")
+            
+        if st.button("📦 Archive votes & reset voters", type="primary"):
+            archive_table = archive_and_reset()
+            st.success(f"✅ Archived current votes to table: {archive_table} and reset tokens.")
+            st.info("🎉 You can now start a new election!")
             st.rerun()
 
         # -------------------- Token generator --------------------
@@ -861,10 +1000,10 @@ if ADMIN:
                 body = st.text_area(
                     "Body",
                     value=(
-                        "Hello {name},\n\n"
-                        "Your voting token for {election} is: {token}\n\n"
+                        "Hello Sir/Madam,\n\n"
+                        "Your voting token is: {token}\n\n"
                         "Voting link: {link}\n\n"
-                        "⏰ **Voting ends at: {end_time} CET**\n\n"  # ✅ NEW: Added end time placeholder
+                        "⏰ **Voting ends at: {end_time}**\n\n"
                         "Regards,\n{sender}"
                     ),
                     key="smtp_body",
