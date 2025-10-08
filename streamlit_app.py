@@ -12,6 +12,11 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+# Initialize session state for admin persistence
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
 
 def send_token_email_smtp(
     receiver_email: str,
@@ -30,7 +35,7 @@ def send_token_email_smtp(
     body_template: str = """\
 Hello Sir/Madam,
 
-Your voting token is: {token}
+Your voting token for {election} is: {token}
 
 Please keep this token safe. It can only be used **once**.
 
@@ -92,10 +97,15 @@ if "archive_done" not in st.session_state:
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
 
-# --- Admin auth helper ---
+# --- Improved Admin auth helper ---
 def is_admin() -> bool:
-    # Already unlocked this session?
+    # Check if already authenticated in this session
     if st.session_state.get("is_admin", False):
+        return True
+    
+    # Check if we have a valid admin session from previous authentication
+    if st.session_state.get("admin_authenticated", False):
+        st.session_state.is_admin = True
         return True
 
     pin_in_secrets = st.secrets.get("ADMIN_PIN", "")  # set this in secrets.toml or Streamlit Cloud
@@ -106,7 +116,9 @@ def is_admin() -> bool:
         if st.button("Unlock", key="unlock_admin"):
             if pin_in_secrets and pin == pin_in_secrets:
                 st.session_state.is_admin = True
+                st.session_state.admin_authenticated = True  # ✅ NEW: persistent flag
                 st.success("Admin mode enabled")
+                st.rerun()  # ✅ NEW: force rerun to apply changes
                 return True
             else:
                 st.error("Wrong PIN")
@@ -116,7 +128,9 @@ def is_admin() -> bool:
             st.info("No ADMIN_PIN found in secrets — dev mode.")
             if st.checkbox("Enable admin (dev)", key="dev_admin"):
                 st.session_state.is_admin = True
+                st.session_state.admin_authenticated = True  # ✅ NEW: persistent flag
                 st.success("Admin mode enabled (dev)")
+                st.rerun()  # ✅ NEW: force rerun to apply changes
                 return True
 
     return False
@@ -610,11 +624,13 @@ if ADMIN:
         m = meta_get_all()
         st.markdown(f"**Status:** {m.get('status')}  |  Start: {m.get('start_cet')}  |  End: {m.get('end_cet')}")
         
-        # ✅ NEW: Show counts for candidates and voters
+        # ✅ UPDATED: Show counts for candidates and voters (count unique voters who voted)
         voters_count = cur.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
         candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-        votes_count = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
-        st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count} | **Votes Cast:** {votes_count}")
+        voters_voted = cur.execute("SELECT COUNT(*) FROM voters WHERE used = 1").fetchone()[0]  # ✅ Count unique voters who voted
+        total_votes = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]  # Total votes across all positions
+        
+        st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count} | **Voters Voted:** {voters_voted}")
         
         # ✅ NEW: Warning if cannot start voting
         if not can_start_voting():
@@ -1001,10 +1017,14 @@ if ADMIN:
                     "Body",
                     value=(
                         "Hello Sir/Madam,\n\n"
-                        "Your voting token is: {token}\n\n"
-                        "Voting link: {link}\n\n"
+                        "Your voting token for {election} is: {token}\n\n"
+                        "Please keep this token safe. It can only be used **once**.\n\n"
+                        "➡️ To cast your vote, use this link:\n"
+                        "{link}\n"
+                        "and enter your token when prompted.\n\n"
                         "⏰ **Voting ends at: {end_time}**\n\n"
-                        "Regards,\n{sender}"
+                        "Thank you,  \n"
+                        "{sender}"
                     ),
                     key="smtp_body",
                 )
