@@ -628,130 +628,123 @@ if ADMIN:
         voters_count = cur.execute("SELECT COUNT(*) FROM voters").fetchone()[0]
         candidates_count = cur.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
         voters_voted = cur.execute("SELECT COUNT(*) FROM voters WHERE used = 1").fetchone()[0]  # ✅ Count unique voters who voted
-        total_votes = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]  # Total votes across all positions
         
         st.markdown(f"**Voters:** {voters_count} | **Candidates:** {candidates_count} | **Voters Voted:** {voters_voted}")
         
-        # ✅ NEW: Warning if cannot start voting
-        if not can_start_voting():
-            st.warning("⚠️ **Cannot start voting:** Need at least 1 candidate and 1 voter")
-
-        # ✅ NEW: Check if archive is required for new election
-        if has_votes() and m.get("status") in ["ended", "published"] and not st.session_state.archive_done:
-            st.error("🚨 **Archive Required:** You must archive votes and reset voters before starting a new election!")
+        # ✅ Use columns to show election controls and archive warning side by side
+        col_main, col_archive = st.columns([3, 1])
         
-        # ---- Create / Schedule new election (robust) ----
-        ename = st.text_input("Election name", value=m.get("name", ""))
+        with col_main:
+            # ---- Create / Schedule new election (robust) ----
+            ename = st.text_input("Election name", value=m.get("name", ""))
+            
+            def _parse_iso(s: str):
+                try:
+                    return datetime.fromisoformat(s)
+                except Exception:
+                    return None
 
-        def _parse_iso(s: str):
-            try:
-                return datetime.fromisoformat(s)
-            except Exception:
-                return None
+            _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
+            _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
 
-        _sdt_saved = _parse_iso(m.get("start_cet", "")) or now_cet()
-        _edt_saved = _parse_iso(m.get("end_cet", ""))   or (now_cet() + timedelta(hours=2))
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Start Time (CET)**")
+                sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
+                stm = st.time_input(
+                    "Start time",
+                    value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
+                    key="start_time",
+                )
+            with col2:
+                st.markdown("**End Time (CET)**")
+                edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
+                etm = st.time_input(
+                    "End time",
+                    value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
+                    key="end_time",
+                )
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Start Time (CET)**")
-            sdt = st.date_input("Start date", value=to_cet(_sdt_saved).date(), key="start_date")
-            stm = st.time_input(
-                "Start time",
-                value=to_cet(_sdt_saved).time().replace(second=0, microsecond=0),
-                key="start_time",
-            )
-        with col2:
-            st.markdown("**End Time (CET)**")
-            edt = st.date_input("End date", value=to_cet(_edt_saved).date(), key="end_date")
-            etm = st.time_input(
-                "End time",
-                value=to_cet(_edt_saved).time().replace(second=0, microsecond=0),
-                key="end_time",
-            )
+            start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
+            end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
 
-        start_dt = datetime.combine(sdt, stm).replace(tzinfo=CET)
-        end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
+            if st.button("Set & Schedule"):
+                # ✅ NEW: Check if archive is required
+                if has_votes() and not st.session_state.archive_done:
+                    st.error("❌ You must archive votes and reset voters before scheduling a new election!")
+                    st.stop()
+                    
+                if end_dt <= start_dt:
+                    st.error("End time must be **after** start time.")
+                elif end_dt <= now_cet():
+                    st.error("End time is already **in the past**. Pick a future end.")
+                else:
+                    meta_set("name", ename)
+                    meta_set("start_cet", start_dt.isoformat())
+                    meta_set("end_cet",   end_dt.isoformat())
+                    meta_set("status",    "scheduled")
+                    meta_set("published", "FALSE")
+                    st.success("Election scheduled (status = scheduled).")
+                    st.rerun()
 
-        st.info(
-            f"**সময়সূচী (CET):**\n"
-            f"- শুরু: {start_dt.strftime('%Y-%m-%d %H:%M')}\n"
-            f"- শেষ:  {end_dt.strftime('%Y-%m-%d %H:%M')}"
-        )
+            c1,c2,c3 = st.columns(3)
+            if c1.button("Start Now"):
+                # ✅ NEW: Check if archive is required
+                if has_votes() and not st.session_state.archive_done:
+                    st.error("❌ You must archive votes and reset voters before starting a new election!")
+                    st.stop()
+                    
+                # ✅ NEW: Check if we can start voting
+                if not can_start_voting():
+                    st.error("❌ Cannot start voting: Need at least 1 candidate and 1 voter")
+                    st.stop()
+                    
+                start_now = now_cet()
+                end_cet_str = meta_get_all().get("end_cet", "")
+                try:
+                    end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
+                except Exception:
+                    end_kept = None
+                if not end_kept or end_kept <= start_now:
+                    end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
-        if st.button("Set & Schedule"):
-            # ✅ NEW: Check if archive is required
-            if has_votes() and not st.session_state.archive_done:
-                st.error("❌ You must archive votes and reset voters before scheduling a new election!")
-                st.stop()
-                
-            if end_dt <= start_dt:
-                st.error("End time must be **after** start time.")
-            elif end_dt <= now_cet():
-                st.error("End time is already **in the past**. Pick a future end.")
-            else:
-                meta_set("name", ename)
-                meta_set("start_cet", start_dt.isoformat())
-                meta_set("end_cet",   end_dt.isoformat())
-                meta_set("status",    "scheduled")
-                meta_set("published", "FALSE")
-                st.success("Election scheduled (status = scheduled).")
+                meta_set("name", ename or m.get("name",""))
+                meta_set("start_cet", start_now.isoformat())
+                meta_set("end_cet",   end_kept.isoformat())
+                meta_set("status",    "ongoing")
+                st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
                 st.rerun()
 
-        c1,c2,c3 = st.columns(3)
-        if c1.button("Start Now"):
-            # ✅ NEW: Check if archive is required
-            if has_votes() and not st.session_state.archive_done:
-                st.error("❌ You must archive votes and reset voters before starting a new election!")
-                st.stop()
-                
-            # ✅ NEW: Check if we can start voting
-            if not can_start_voting():
-                st.error("❌ Cannot start voting: Need at least 1 candidate and 1 voter")
-                st.stop()
-                
-            start_now = now_cet()
-            end_cet_str = meta_get_all().get("end_cet", "")
-            try:
-                end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
-            except Exception:
-                end_kept = None
-            if not end_kept or end_kept <= start_now:
-                end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
+            if c2.button("End Now"):
+                end_now = now_cet()
+                meta_set("end_cet", end_now.isoformat())
+                meta_set("status", "ended")
+                st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
+                st.rerun()
 
-            meta_set("name", ename or m.get("name",""))
-            meta_set("start_cet", start_now.isoformat())
-            meta_set("end_cet",   end_kept.isoformat())
-            meta_set("status",    "ongoing")
-            st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
-            st.rerun()
+            if c3.button("Publish Results"):
+                meta_set("published","TRUE")
+                meta_set("status","ended")
+                st.success("Results published and winners are now visible!")
+                st.rerun()
 
-        if c2.button("End Now"):
-            end_now = now_cet()
-            meta_set("end_cet", end_now.isoformat())
-            meta_set("status", "ended")
-            st.success(f"Election ended at {end_now.strftime('%Y-%m-%d %H:%M CET')}.")
-            st.rerun()
-
-        if c3.button("Publish Results"):
-            meta_set("published","TRUE")
-            meta_set("status","ended")
-            st.success("Results published and winners are now visible!")
-            st.rerun()
+        with col_archive:
+            # ✅ Archive warning and controls in separate column
+            st.markdown("### 🗄️ Archive & Reset")
+            
+            if has_votes() and m.get("status") in ["ended", "published"] and not st.session_state.archive_done:
+                st.error("🚨 **Archive Required**")
+                st.info("You must archive votes and reset voters before starting a new election!")
+            
+            if st.button("📦 Archive votes & reset voters", type="primary", use_container_width=True):
+                archive_table = archive_and_reset()
+                st.success(f"✅ Archived current votes to table: {archive_table}")
+                st.success("✅ All voter tokens have been reset")
+                st.success("🎉 You can now start a new election!")
+                st.rerun()
 
         st.divider()
-        st.markdown("### 🗄️ Archive & Reset for a New Election")
-
-        # ✅ NEW: Force archive before new election
-        if has_votes():
-            st.warning("🔒 **Archive Required:** You must archive current votes before starting a new election.")
-            
-        if st.button("📦 Archive votes & reset voters", type="primary"):
-            archive_table = archive_and_reset()
-            st.success(f"✅ Archived current votes to table: {archive_table} and reset tokens.")
-            st.info("🎉 You can now start a new election!")
-            st.rerun()
-
+        
         # -------------------- Token generator --------------------
         st.markdown("### 🔑 Generate tokens")
         g1, g2 = st.columns(2)
@@ -871,12 +864,7 @@ if ADMIN:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-
-
-
-
         # -------------------- Voters (always editable; add rows inline; CSV replaces) --------------------
-
         st.markdown("### 👥 Voters")
 
         c_left, c_right = st.columns([3, 2])
@@ -984,17 +972,11 @@ if ADMIN:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-        # Email to selected voters
-
         # -------------------- Email to selected voters --------------------
-
-        # Step 1: toggle showing SMTP settings
         if st.button("📧 Send email to selected voters"):
             st.session_state.show_smtp = True
 
-        # Step 2: show the SMTP form if toggled
         if st.session_state.get("show_smtp", False):
-
             selected = edited[edited.get("send_email", False) == True]
             if selected.empty:
                 st.warning("No voters selected for email.")
@@ -1031,10 +1013,9 @@ if ADMIN:
 
                 sender_name = "BYWOB Voting"
 
-                # Actual send button
                 if st.button("🚀 Really send emails", type="primary"):
                     election_name = meta_get_all().get("name", "Election")
-                    end_time_formatted = get_formatted_end_time()  # ✅ NEW: Get formatted end time
+                    end_time_formatted = get_formatted_end_time()
                     sent_ok, sent_fail = 0, []
 
                     for _, r in selected.iterrows():
@@ -1050,7 +1031,7 @@ if ADMIN:
                                 sender_email=st.session_state["sender_email"],
                                 sender_password=st.session_state["sender_password"],
                                 sender_name=sender_name,
-                                end_time_cet=end_time_formatted,  # ✅ NEW: Pass end time to email function
+                                end_time_cet=end_time_formatted,
                                 use_ssl=True,
                                 subject_template=st.session_state["smtp_subject"],
                                 body_template=st.session_state["smtp_body"],
