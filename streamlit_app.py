@@ -17,6 +17,8 @@ if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "admin_authenticated" not in st.session_state:
     st.session_state.admin_authenticated = False
+if "file_upload_key" not in st.session_state:
+    st.session_state.file_upload_key = 0
 
 def send_token_email_smtp(
     receiver_email: str,
@@ -677,51 +679,46 @@ if ADMIN:
             end_dt   = datetime.combine(edt, etm).replace(tzinfo=CET)
 
             if st.button("Set & Schedule"):
-                # ✅ NEW: Check if archive is required
+                # ✅ FIXED: Check if archive is required without st.stop()
                 if has_votes() and not st.session_state.archive_done:
                     st.error("❌ You must archive votes and reset voters before scheduling a new election!")
-                    st.stop()
-                    
-                if end_dt <= start_dt:
-                    st.error("End time must be **after** start time.")
-                elif end_dt <= now_cet():
-                    st.error("End time is already **in the past**. Pick a future end.")
                 else:
-                    meta_set("name", ename)
-                    meta_set("start_cet", start_dt.isoformat())
-                    meta_set("end_cet",   end_dt.isoformat())
-                    meta_set("status",    "scheduled")
-                    meta_set("published", "FALSE")
-                    st.success("Election scheduled (status = scheduled).")
-                    st.rerun()
+                    if end_dt <= start_dt:
+                        st.error("End time must be **after** start time.")
+                    elif end_dt <= now_cet():
+                        st.error("End time is already **in the past**. Pick a future end.")
+                    else:
+                        meta_set("name", ename)
+                        meta_set("start_cet", start_dt.isoformat())
+                        meta_set("end_cet",   end_dt.isoformat())
+                        meta_set("status",    "scheduled")
+                        meta_set("published", "FALSE")
+                        st.success("Election scheduled (status = scheduled).")
+                        st.rerun()
 
             c1,c2,c3 = st.columns(3)
             if c1.button("Start Now"):
-                # ✅ NEW: Check if archive is required
+                # ✅ FIXED: Check both archive requirement AND voter/candidate lists
                 if has_votes() and not st.session_state.archive_done:
                     st.error("❌ You must archive votes and reset voters before starting a new election!")
-                    st.stop()
-                    
-                # ✅ NEW: Check if we can start voting
-                if not can_start_voting():
+                elif not can_start_voting():
                     st.error("❌ Cannot start voting: Need at least 1 candidate and 1 voter")
-                    st.stop()
-                    
-                start_now = now_cet()
-                end_cet_str = meta_get_all().get("end_cet", "")
-                try:
-                    end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
-                except Exception:
-                    end_kept = None
-                if not end_kept or end_kept <= start_now:
-                    end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
+                else:
+                    start_now = now_cet()
+                    end_cet_str = meta_get_all().get("end_cet", "")
+                    try:
+                        end_kept = datetime.fromisoformat(end_cet_str) if end_cet_str else None
+                    except Exception:
+                        end_kept = None
+                    if not end_kept or end_kept <= start_now:
+                        end_kept = (start_now + timedelta(hours=2)).replace(second=0, microsecond=0)
 
-                meta_set("name", ename or m.get("name",""))
-                meta_set("start_cet", start_now.isoformat())
-                meta_set("end_cet",   end_kept.isoformat())
-                meta_set("status",    "ongoing")
-                st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
-                st.rerun()
+                    meta_set("name", ename or m.get("name",""))
+                    meta_set("start_cet", start_now.isoformat())
+                    meta_set("end_cet",   end_kept.isoformat())
+                    meta_set("status",    "ongoing")
+                    st.success(f"Election started now. Ends {end_kept.strftime('%Y-%m-%d %H:%M CET')}.")
+                    st.rerun()
 
             if c2.button("End Now"):
                 end_now = now_cet()
@@ -806,7 +803,8 @@ if ADMIN:
             cl, cr = st.columns([3, 2])
 
             with cr:
-                cand_csv = st.file_uploader("Upload Candidates CSV (position,candidate)", type=["csv"], key="cand_csv_uploader")
+                # ✅ FIXED: Use session state key to prevent rerun issues
+                cand_csv = st.file_uploader("Upload Candidates CSV (position,candidate)", type=["csv"], key=f"cand_csv_uploader_{st.session_state.file_upload_key}")
                 if cand_csv is not None:
                     try:
                         cdf = pd.read_csv(cand_csv).fillna("")
@@ -834,6 +832,8 @@ if ADMIN:
                                 )
                             conn.commit()
                             st.success(f"Imported {len(imp)} candidates (replaced previous list).")
+                            # ✅ FIXED: Increment key to reset uploader without full rerun
+                            st.session_state.file_upload_key += 1
                             st.rerun()
                     except Exception as e:
                         st.error(f"CSV read failed: {e}")
@@ -892,7 +892,8 @@ if ADMIN:
                 show_tokens = st.checkbox("Show tokens", value=False, help="Unmask tokens to edit/copy.")
 
             with c_right:
-                csv_file  = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"], key="voter_csv_uploader")
+                # ✅ FIXED: Use session state key to prevent rerun issues
+                csv_file = st.file_uploader("Upload CSV (name,email[,token])", type=["csv"], key=f"voter_csv_uploader_{st.session_state.file_upload_key}")
                 auto_pref = st.text_input("Auto-token prefix", value="BYWOB-2025")
 
                 if csv_file is not None:
@@ -926,6 +927,8 @@ if ADMIN:
 
                             conn.commit()
                             st.success(f"Imported {inserted} voters (replaced previous list).")
+                            # ✅ FIXED: Increment key to reset uploader without full rerun
+                            st.session_state.file_upload_key += 1
                             st.rerun()
                     except Exception as e:
                         st.error(f"CSV read failed: {e}")
