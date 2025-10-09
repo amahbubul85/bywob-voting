@@ -78,12 +78,14 @@ Thank you,
 
     if use_ssl:
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
-            server.login(sender_email, sender_password)
+            if sender_password and sender_password.strip(): 
+                server.login(sender_email, sender_password)
             server.sendmail(sender_email, receiver_email, msg.as_string())
     else:
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
-            server.login(sender_email, sender_password)
+            if sender_password and sender_password.strip(): 
+                server.login(sender_email, sender_password)
             server.sendmail(sender_email, receiver_email, msg.as_string())
 
 
