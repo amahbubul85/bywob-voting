@@ -569,22 +569,16 @@ def get_voter_email_by_token(token: str):
         return row[0], row[1]  # email, name
     return None, None
 
-# ✅ NEW: Send confirmation email after voting
+# ✅ NEW: Send confirmation email after voting (CLEAN VERSION - NO DEBUG)
 def send_vote_confirmation(token: str):
     """Send confirmation email to voter after successful voting"""
     settings = st.session_state.confirmation_email_settings
-    
-    # Debug info
-    st.write(f"🔧 Debug: Confirmation emails enabled: {settings['enabled']}")
-    st.write(f"🔧 Debug: Sender email: {settings['sender_email']}")
-    st.write(f"🔧 Debug: Has password: {bool(settings['sender_password'])}")
     
     if not settings["enabled"]:
         return False, "Confirmation emails are disabled"
     
     # Get voter email and name
     email, name = get_voter_email_by_token(token)
-    st.write(f"🔧 Debug: Voter email found: {email}")
     
     if not email:
         return False, "Voter email not found"
@@ -602,7 +596,6 @@ def send_vote_confirmation(token: str):
         )
         return True, "Confirmation email sent successfully"
     except Exception as e:
-        st.write(f"🔧 Debug: Email sending error: {str(e)}")
         return False, f"Failed to send confirmation email: {str(e)}"
 
 # --------------------------------------------------------------------------------------
