@@ -20,6 +20,18 @@ if "admin_authenticated" not in st.session_state:
 if "file_upload_key" not in st.session_state:
     st.session_state.file_upload_key = 0
 
+# ✅ NEW: Auto-load SMTP settings from secrets on app start
+if "confirmation_email_settings" not in st.session_state:
+    smtp_secrets = st.secrets.get("smtp", {})
+    st.session_state.confirmation_email_settings = {
+        "enabled": bool(smtp_secrets.get("email") and smtp_secrets.get("password")),
+        "sender_email": smtp_secrets.get("email", ""),
+        "sender_password": smtp_secrets.get("password", ""),
+        "smtp_server": smtp_secrets.get("server", "smtp.gmail.com"),
+        "smtp_port": smtp_secrets.get("port", 465),
+        "sender_name": smtp_secrets.get("sender_name", "BYWOB Voting System")
+    }
+
 def send_token_email_smtp(
     receiver_email: str,
     receiver_name: str,
@@ -149,17 +161,6 @@ if "show_smtp" not in st.session_state:
 # ✅ NEW: Track if archive has been done for new election
 if "archive_done" not in st.session_state:
     st.session_state.archive_done = False
-
-# ✅ NEW: Track confirmation email settings
-if "confirmation_email_settings" not in st.session_state:
-    st.session_state.confirmation_email_settings = {
-        "enabled": False,
-        "sender_email": "",
-        "sender_password": "",
-        "smtp_server": "smtp.gmail.com",
-        "smtp_port": 465,
-        "sender_name": "BYWOB Voting"
-    }
 
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
@@ -572,11 +573,19 @@ def get_voter_email_by_token(token: str):
 def send_vote_confirmation(token: str):
     """Send confirmation email to voter after successful voting"""
     settings = st.session_state.confirmation_email_settings
+    
+    # Debug info
+    st.write(f"🔧 Debug: Confirmation emails enabled: {settings['enabled']}")
+    st.write(f"🔧 Debug: Sender email: {settings['sender_email']}")
+    st.write(f"🔧 Debug: Has password: {bool(settings['sender_password'])}")
+    
     if not settings["enabled"]:
         return False, "Confirmation emails are disabled"
     
     # Get voter email and name
     email, name = get_voter_email_by_token(token)
+    st.write(f"🔧 Debug: Voter email found: {email}")
+    
     if not email:
         return False, "Voter email not found"
     
@@ -593,6 +602,7 @@ def send_vote_confirmation(token: str):
         )
         return True, "Confirmation email sent successfully"
     except Exception as e:
+        st.write(f"🔧 Debug: Email sending error: {str(e)}")
         return False, f"Failed to send confirmation email: {str(e)}"
 
 # --------------------------------------------------------------------------------------
