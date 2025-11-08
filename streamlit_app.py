@@ -88,7 +88,59 @@ Thank you,
                 server.login(sender_email, sender_password)
             server.sendmail(sender_email, receiver_email, msg.as_string())
 
+# ✅ NEW: Function to send confirmation email after voting
+def send_confirmation_email_smtp(
+    receiver_email: str,
+    receiver_name: str,
+    election_name: str,
+    smtp_server: str,
+    smtp_port: int,
+    sender_email: str,
+    sender_password: str,
+    sender_name: str = "Election Admin",
+    use_ssl: bool = True,
+    subject_template: str = "✅ Vote Confirmation for {election}",
+    body_template: str = """\
+Hello {name},
 
+This email confirms that your vote for **{election}** has been successfully recorded.
+
+Your participation in this election is important and appreciated.
+
+This is an automated confirmation - please do not reply to this email.
+
+Thank you for voting!  
+{sender}
+""",
+):
+    """Send a confirmation email to a voter after they cast their vote."""
+
+    # Format subject and body
+    subject = subject_template.format(election=election_name, name=receiver_name)
+    body = body_template.format(
+        election=election_name,
+        name=receiver_name,
+        sender=sender_name,
+    )
+
+    # Build email
+    msg = MIMEMultipart()
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["To"] = receiver_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+            if sender_password and sender_password.strip(): 
+                server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            if sender_password and sender_password.strip(): 
+                server.login(sender_email, sender_password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
 
 st.set_page_config(page_title="BYWOB Online Voting", page_icon="🗳️", layout="centered")
 if "show_smtp" not in st.session_state:
@@ -97,6 +149,17 @@ if "show_smtp" not in st.session_state:
 # ✅ NEW: Track if archive has been done for new election
 if "archive_done" not in st.session_state:
     st.session_state.archive_done = False
+
+# ✅ NEW: Track confirmation email settings
+if "confirmation_email_settings" not in st.session_state:
+    st.session_state.confirmation_email_settings = {
+        "enabled": False,
+        "sender_email": "",
+        "sender_password": "",
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 465,
+        "sender_name": "BYWOB Voting"
+    }
 
 st.title("🗳️ BYWOB Online Voting")
 st.caption("Streamlit Cloud + SQLite • Secret ballot with one-time tokens")
@@ -495,6 +558,43 @@ def delete_voter(row_id: int):
     cur.execute("DELETE FROM voters WHERE id=?", (int(row_id),))
     conn.commit()
 
+# ✅ NEW: Get voter email by token
+def get_voter_email_by_token(token: str):
+    row = cur.execute(
+        "SELECT email, name FROM voters WHERE UPPER(TRIM(token)) = UPPER(TRIM(?))",
+        (token,)
+    ).fetchone()
+    if row:
+        return row[0], row[1]  # email, name
+    return None, None
+
+# ✅ NEW: Send confirmation email after voting
+def send_vote_confirmation(token: str):
+    """Send confirmation email to voter after successful voting"""
+    settings = st.session_state.confirmation_email_settings
+    if not settings["enabled"]:
+        return False, "Confirmation emails are disabled"
+    
+    # Get voter email and name
+    email, name = get_voter_email_by_token(token)
+    if not email:
+        return False, "Voter email not found"
+    
+    try:
+        send_confirmation_email_smtp(
+            receiver_email=email,
+            receiver_name=name or "Voter",
+            election_name=meta_get_all().get("name", "Election"),
+            smtp_server=settings["smtp_server"],
+            smtp_port=settings["smtp_port"],
+            sender_email=settings["sender_email"],
+            sender_password=settings["sender_password"],
+            sender_name=settings["sender_name"]
+        )
+        return True, "Confirmation email sent successfully"
+    except Exception as e:
+        return False, f"Failed to send confirmation email: {str(e)}"
+
 # --------------------------------------------------------------------------------------
 # UI Tabs
 # --------------------------------------------------------------------------------------
@@ -580,7 +680,18 @@ with tab_vote:
                 for p, c in selections.items():
                     append_vote(p, c)
                 mark_token_used(st.session_state.ballot["token"])
-                st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে।")
+                
+                # ✅ NEW: Send confirmation email
+                if st.session_state.confirmation_email_settings["enabled"]:
+                    success, message = send_vote_confirmation(st.session_state.ballot["token"])
+                    if success:
+                        st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে এবং একটি কনফার্মেশন ইমেইল পাঠানো হয়েছে।")
+                    else:
+                        st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে।")
+                        st.warning(f"কনফার্মেশন ইমেইল পাঠানো যায়নি: {message}")
+                else:
+                    st.success("আপনার সকল ভোট গ্রহণ করা হয়েছে।")
+                
                 st.session_state.ballot = {"ready": False}
                 st.rerun()
 
@@ -758,6 +869,90 @@ if ADMIN:
                 st.success("🎉 Ready for new election!")
                 st.rerun()
 
+        st.divider()
+        
+        # -------------------- Confirmation Email Settings --------------------
+        st.markdown("### 📧 Confirmation Email Settings")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Toggle for confirmation emails
+            confirmation_enabled = st.checkbox(
+                "Enable confirmation emails", 
+                value=st.session_state.confirmation_email_settings["enabled"],
+                help="Send confirmation emails to voters after they cast their votes"
+            )
+            
+            # SMTP settings for confirmation emails
+            st.markdown("#### SMTP Settings for Confirmations")
+            conf_sender_email = st.text_input(
+                "Sender email", 
+                value=st.session_state.confirmation_email_settings["sender_email"],
+                key="conf_sender_email"
+            )
+            conf_sender_password = st.text_input(
+                "Sender password", 
+                type="password",
+                value=st.session_state.confirmation_email_settings["sender_password"],
+                key="conf_sender_password"
+            )
+            
+        with col2:
+            conf_smtp_server = st.text_input(
+                "SMTP server", 
+                value=st.session_state.confirmation_email_settings["smtp_server"],
+                key="conf_smtp_server"
+            )
+            conf_smtp_port = st.number_input(
+                "SMTP port", 
+                value=st.session_state.confirmation_email_settings["smtp_port"],
+                key="conf_smtp_port"
+            )
+            conf_sender_name = st.text_input(
+                "Sender name", 
+                value=st.session_state.confirmation_email_settings["sender_name"],
+                key="conf_sender_name"
+            )
+        
+        # Save confirmation email settings
+        if st.button("💾 Save Confirmation Email Settings"):
+            st.session_state.confirmation_email_settings = {
+                "enabled": confirmation_enabled,
+                "sender_email": conf_sender_email,
+                "sender_password": conf_sender_password,
+                "smtp_server": conf_smtp_server,
+                "smtp_port": conf_smtp_port,
+                "sender_name": conf_sender_name
+            }
+            if confirmation_enabled:
+                st.success("Confirmation email settings saved and enabled!")
+            else:
+                st.success("Confirmation email settings saved (disabled)")
+        
+        # Test confirmation email
+        if st.session_state.confirmation_email_settings["enabled"]:
+            st.markdown("#### Test Confirmation Email")
+            test_email = st.text_input("Test email address", placeholder="Enter email to test confirmation")
+            if st.button("Send Test Confirmation"):
+                if test_email:
+                    try:
+                        send_confirmation_email_smtp(
+                            receiver_email=test_email,
+                            receiver_name="Test Voter",
+                            election_name=meta_get_all().get("name", "Test Election"),
+                            smtp_server=st.session_state.confirmation_email_settings["smtp_server"],
+                            smtp_port=st.session_state.confirmation_email_settings["smtp_port"],
+                            sender_email=st.session_state.confirmation_email_settings["sender_email"],
+                            sender_password=st.session_state.confirmation_email_settings["sender_password"],
+                            sender_name=st.session_state.confirmation_email_settings["sender_name"]
+                        )
+                        st.success("✅ Test confirmation email sent successfully!")
+                    except Exception as e:
+                        st.error(f"❌ Failed to send test email: {str(e)}")
+                else:
+                    st.warning("Please enter a test email address")
+        
         st.divider()
         
         # -------------------- Token generator --------------------
